@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+logs/*
+!logs/.gitkeep
+!logs/alerts.log
+alerts/
+.venv/
+venv/
+
+# Large ML model file - share separately (e.g. Google Drive)
+*.joblib
+*.pkl
+
+# Secrets — never commit
+gemini_api_key.txt

@@ -1,0 +1,47 @@
+Create a modern desktop GUI dashboard for an Intrusion Detection System (IDS) inspired by the layout and usability of Wireshark.
+
+The interface should be divided into clear sections:
+
+Top Navigation Bar:
+Include menus: File, Edit, View, Capture, Analyze, Statistics
+Add toolbar buttons for Start Capture, Stop Capture, Restart, Open File, Save File
+Use recognizable icons (e.g., play/stop, folder, save)
+Filter/Search Bar:
+Place directly under the toolbar
+Allow users to enter filtering expressions (e.g., IP address, protocol, port)
+Provide real-time validation (green for valid filters, red for invalid)
+Main Packet List Table (Top Section):
+Display captured network packets in a table
+Columns: Packet Number, Timestamp, Source IP, Destination IP, Protocol, Length, Info
+Support sorting and row selection
+Apply color-coded rows based on protocol or threat level (e.g., TCP, UDP, HTTP, suspicious traffic)
+Packet Details Panel (Middle Section):
+When a packet is selected, show a hierarchical tree view of its structure
+Include layers such as Frame, Ethernet, IP, TCP/UDP, and Application Layer
+Allow expandable/collapsible nodes
+Packet Bytes Viewer (Bottom Section):
+Show raw packet data in two formats:
+Hexadecimal view (left)
+ASCII representation (right)
+Highlight selected fields when clicked in the details panel
+Status Bar (Bottom):
+Display total packets captured, filtered packets, active interface, and system status
+Include real-time updates
+IDS-Specific Enhancements:
+Add a threat level indicator (Low, Medium, High, Critical)
+Include alert notifications for suspicious packets
+Provide a sidebar or panel for detected attacks (e.g., DoS, port scanning)
+Integrate simple charts (traffic over time, protocol distribution)
+Design Requirements:
+Use a clean, modern dark theme
+Ensure responsive layout with resizable panels (split view)
+Use consistent spacing, icons, and color coding
+Prioritize readability and real-time monitoring
+
+Technology:
+
+Implement using [specify: Python Tkinter / PyQt / Web dashboard / React]
+Use modular and maintainable code structure
+
+Goal:
+Build a professional, Wireshark-like IDS dashboard that allows users to monitor, filter, inspect, and analyze network traffic efficiently, while also highlighting potential security threats in real time.

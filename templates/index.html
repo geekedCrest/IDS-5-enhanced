@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>µIDS Dashboard</title>
+  <link rel="icon" href="/static/favicon.ico" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<!-- ─── Menu Bar ──────────────────────────────────────────────────────────── -->
+<header class="menubar">
+  <div class="logo">
+    <span class="logo-mark">µIDS</span>
+    <span class="logo-sub">Sentinel Grid</span>
+  </div>
+  <nav class="menus">
+    <div class="menu-item" data-menu="file">File
+      <div class="dropdown">
+        <div class="dd-item" onclick="openFile()"><span class="icon">📂</span> Open Capture (.pcap)…</div>
+        <div class="dd-item" onclick="saveCapture()"><span class="icon">💾</span> Save Capture (.pcap)…</div>
+        <div class="dd-item" onclick="document.getElementById('rules-upload-input').click()"><span class="icon">📥</span> Import Rules…</div>
+        <div class="dd-sep"></div>
+        <div class="dd-item"><span class="icon">📋</span> Export Rules…</div>
+        <div class="dd-sep"></div>
+        <div class="dd-item"><span class="icon">✖</span> Quit</div>
+      </div>
+    </div>
+    <div class="menu-item" data-menu="edit">Edit
+      <div class="dropdown">
+        <div class="dd-item"><span class="icon">🔍</span> Find Packet…</div>
+        <div class="dd-item"><span class="icon">📌</span> Mark All Displayed</div>
+        <div class="dd-sep"></div>
+        <div class="dd-item"><span class="icon">🗑</span> Clear Packets</div>
+      </div>
+    </div>
+    <div class="menu-item" data-menu="view">View
+      <div class="dropdown">
+        <div class="dd-item" onclick="togglePanel('panel-hex')"><span class="icon">🔢</span> Hex Viewer</div>
+        <div class="dd-item" onclick="togglePanel('panel-alerts')"><span class="icon">🚨</span> Alerts Sidebar</div>
+        <div class="dd-item" onclick="togglePanel('panel-charts')"><span class="icon">📊</span> Charts Panel</div>
+        <div class="dd-sep"></div>
+        <div class="dd-item" onclick="toggleTheme()"><span class="icon">🌓</span> Toggle Theme</div>
+      </div>
+    </div>
+    <div class="menu-item" data-menu="capture">Capture
+      <div class="dropdown">
+        <div class="dd-item" onclick="startCapture()"><span class="icon">▶</span> Start</div>
+        <div class="dd-item" onclick="stopCapture()"><span class="icon">⏹</span> Stop</div>
+        <div class="dd-item" onclick="restartCapture()"><span class="icon">🔄</span> Restart</div>
+        <div class="dd-sep"></div>
+        <div class="dd-item" onclick="showModal('modal-rules')"><span class="icon">📜</span> Manage Rules</div>
+      </div>
+    </div>
+    <div class="menu-item" data-menu="analyze">Analyze
+      <div class="dropdown">
+        <div class="dd-item" onclick="showTab('alerts')"><span class="icon">🚨</span> View Alerts</div>
+        <div class="dd-item" onclick="showTab('stats')"><span class="icon">📈</span> Protocol Stats</div>
+        <div class="dd-item"><span class="icon">🌐</span> Expert Info</div>
+      </div>
+    </div>
+    <div class="menu-item" data-menu="statistics">Statistics
+      <div class="dropdown">
+        <div class="dd-item" onclick="showTab('stats')"><span class="icon">🥧</span> Protocol Distribution</div>
+        <div class="dd-item"><span class="icon">📉</span> IO Graph</div>
+        <div class="dd-item"><span class="icon">🔁</span> Conversations</div>
+      </div>
+    </div>
+  </nav>
+  <div class="menu-spacer"></div>
+  <div class="menu-right" id="uptime-display">00:00:00</div>
+</header>
+
+<!-- ─── Toolbar ───────────────────────────────────────────────────────────── -->
+<div class="toolbar">
+  <button class="tb-btn tb-start" id="btn-start" onclick="startCapture()" title="Start Capture">
+    <svg viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21"/></svg>
+    Start
+  </button>
+  <button class="tb-btn tb-stop" id="btn-stop" onclick="stopCapture()" title="Stop Capture" disabled>
+    <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16"/></svg>
+    Stop
+  </button>
+  <button class="tb-btn tb-pause" id="btn-pause" onclick="pauseCapture()" title="Pause" disabled>
+    <svg viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+    Pause
+  </button>
+  <button class="tb-btn" onclick="restartCapture()" title="Restart">
+    <svg viewBox="0 0 24 24"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0020 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 004 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
+    Restart
+  </button>
+  <div class="tb-sep"></div>
+  <button class="tb-btn" onclick="openFile()" title="Open a .pcap capture file">
+    <svg viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2z"/></svg>
+    Open
+  </button>
+  <button class="tb-btn" onclick="saveCapture()" title="Save current traffic as a .pcap file">
+    <svg viewBox="0 0 24 24"><path d="M17 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V7l-4-4zm-5 16a3 3 0 110-6 3 3 0 010 6zm3-10H5V5h10v4z"/></svg>
+    Save
+  </button>
+  <div class="tb-sep"></div>
+  <button class="tb-btn" onclick="showModal('modal-rules')" title="Rules">
+    <svg viewBox="0 0 24 24"><path d="M3 5h2V3a2 2 0 012-2h10a2 2 0 012 2v2h2a1 1 0 010 2h-1v13a2 2 0 01-2 2H5a2 2 0 01-2-2V7H2a1 1 0 010-2h1z"/></svg>
+    Rules
+  </button>
+  <div class="rules-file-selector-wrap" style="display: flex; align-items: center; gap: 4px; margin-left: 2px;">
+    <select id="rules-file-dropdown" onchange="changeRulesFile(this.value)" class="iface-selector" style="margin-right: 0; padding: 3px 8px; font-family: inherit; font-size: 11px; height: 24px;">
+      <option value="default.rules">default.rules</option>
+    </select>
+    <label class="tb-btn" style="cursor: pointer; padding: 4px 8px; display: inline-flex; align-items: center; gap: 4px; height: 24px; font-size: 11px; border: 1px dashed var(--border2); border-radius: 4px; background: rgba(25,199,242,0.06); transition: all 0.2s;" title="Import Snort Rules File (.rules)">
+      <svg viewBox="0 0 24 24" style="width: 12px; height: 12px; color: var(--accent2);"><path d="M19.35 10.04A7.49 7.49 0 0012 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 000 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
+      Import
+      <input type="file" id="rules-upload-input" accept=".rules" style="display:none" onchange="uploadRulesFile(this)">
+    </label>
+  </div>
+  <button class="tb-btn" onclick="showTab('stats')" title="Statistics">
+    <svg viewBox="0 0 24 24"><path d="M3 3v18h18v-2H5V3H3zm4 14l4-4 4 4 4-8"/></svg>
+    Stats
+  </button>
+  <button class="tb-btn" onclick="showTab('classifier'); loadClassifierTab()" title="Packet Classifier">
+    <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+    Classify
+  </button>
+  <div class="tb-sep"></div>
+  <div class="mode-toggle-wrap" style="display: flex; align-items: center; background: rgba(0,0,0,0.35); border: 1px solid var(--border2); border-radius: 6px; padding: 2px; height: 26px; user-select: none;">
+    <button class="mode-btn active" id="mode-btn-sim" onclick="setCaptureMode(false)" style="padding: 2px 10px; border: none; border-radius: 4px; background: transparent; color: var(--text2); font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit; height: 100%; display: flex; align-items: center;">Simulation</button>
+    <button class="mode-btn" id="mode-btn-live" onclick="setCaptureMode(true)" style="padding: 2px 10px; border: none; border-radius: 4px; background: transparent; color: var(--text2); font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit; height: 100%; display: flex; align-items: center;">Live Sniffer</button>
+  </div>
+  <div class="tb-spacer"></div>
+  <button class="iface-selector" onclick="openInterfacePicker()" title="Select capture interface">
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" style="color:var(--text3)"><path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z"/></svg>
+    <span id="iface-current-label">Loading…</span>
+    <svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor" style="color:var(--text3)"><path d="M7 10l5 5 5-5z"/></svg>
+  </button>
+  <div class="capture-indicator" id="capture-indicator">
+    <span class="ci-dot" id="ci-dot"></span>
+    <span id="ci-label">Idle</span>
+  </div>
+</div>
+
+<!-- ─── Filter Bar ────────────────────────────────────────────────────────── -->
+<div class="filterbar">
+  <label class="filter-label">Filter:</label>
+  <div class="filter-input-wrap" id="filter-wrap">
+    <input type="text" id="filter-input" placeholder='e.g. tcp, 192.168.0.1, port 80, "CRITICAL"…'
+      oninput="onFilterInput(this.value)" onkeydown="if(event.key==='Enter')applyFilter()" />
+    <button class="filter-clear" onclick="clearFilter()" title="Clear">✕</button>
+  </div>
+  <button class="filter-apply" onclick="applyFilter()">Apply</button>
+  <div class="filter-hint" id="filter-hint"></div>
+</div>
+
+<!-- ─── Main Layout ───────────────────────────────────────────────────────── -->
+<div class="main-layout">
+
+  <!-- Left: Packet panels -->
+  <div class="panels-col" id="panels-col">
+
+    <!-- Tabs -->
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="packets" onclick="showTab('packets')">Packets</button>
+      <button class="tab-btn" data-tab="alerts" onclick="showTab('alerts')">
+        Alerts <span class="badge" id="badge-alerts">0</span>
+      </button>
+      <button class="tab-btn" data-tab="stats" onclick="showTab('stats')">Statistics</button>
+      <button class="tab-btn" data-tab="classifier" onclick="showTab('classifier'); loadClassifierTab()">Classifier</button>
+      <button class="tab-btn" data-tab="rules" onclick="showTab('rules'); loadRulesTab()">Rules</button>
+    </div>
+
+    <!-- Packets Tab -->
+    <div class="tab-content active" id="tab-packets">
+      <div class="packet-table-wrap" id="packet-table-wrap">
+        <table class="packet-table" id="packet-table">
+          <thead>
+            <tr>
+              <th class="col-no" onclick="sortTable('id')">No. <span class="sort-arrow" id="sort-id"></span></th>
+              <th class="col-ts" onclick="sortTable('ts')">Time <span class="sort-arrow" id="sort-ts"></span></th>
+              <th class="col-src" onclick="sortTable('src_ip')">Source <span class="sort-arrow" id="sort-src_ip"></span></th>
+              <th class="col-dst" onclick="sortTable('dst_ip')">Destination <span class="sort-arrow" id="sort-dst_ip"></span></th>
+              <th class="col-proto" onclick="sortTable('proto')">Protocol <span class="sort-arrow" id="sort-proto"></span></th>
+              <th class="col-len" onclick="sortTable('length')">Length <span class="sort-arrow" id="sort-length"></span></th>
+              <th class="col-threat">Threat</th>
+              <th class="col-info">Info</th>
+            </tr>
+          </thead>
+          <tbody id="packet-tbody"></tbody>
+        </table>
+      </div>
+
+      <!-- Details Panel -->
+      <div class="detail-panel" id="detail-panel">
+        <div class="detail-header">
+          <span>Packet Details</span>
+          <span class="detail-hint" id="detail-hint">Select a packet to inspect</span>
+        </div>
+        <div class="detail-tree" id="detail-tree">
+          <div class="empty-state">No packet selected</div>
+        </div>
+      </div>
+
+      <!-- Hex Panel -->
+      <div class="hex-panel" id="panel-hex">
+        <div class="hex-header">Packet Bytes</div>
+        <div class="hex-body" id="hex-body">
+          <div class="empty-state">No packet selected</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Alerts Tab -->
+    <div class="tab-content" id="tab-alerts">
+      <div class="alerts-tab-inner">
+        <div class="alerts-controls">
+          <button class="btn-sm" onclick="clearAlerts()">Clear All</button>
+          <span class="alerts-count-label" id="alerts-count-label">0 alerts</span>
+        </div>
+        <table class="packet-table" id="alert-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Time</th>
+              <th>Type</th>
+              <th>Threat</th>
+              <th>Source</th>
+              <th>Destination</th>
+              <th>Protocol</th>
+              <th>Rule / Detail</th>
+            </tr>
+          </thead>
+          <tbody id="alert-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Stats Tab -->
+    <div class="tab-content" id="tab-stats">
+      <div class="stats-grid">
+
+        <!-- Row 1: 3 charts -->
+        <div class="stats-card">
+          <h3>Protocol Distribution</h3>
+          <div class="chart-wrap"><canvas id="chart-proto"></canvas></div>
+        </div>
+        <div class="stats-card">
+          <h3>Traffic Rate (pkt/s)</h3>
+          <div class="chart-wrap"><canvas id="chart-traffic"></canvas></div>
+        </div>
+        <div class="stats-card">
+          <h3>Bandwidth (bytes/s)</h3>
+          <div class="chart-wrap"><canvas id="chart-bw"></canvas></div>
+        </div>
+
+        <!-- Row 2: threat chart + expanded counters -->
+        <div class="stats-card">
+          <h3>Threat Level Distribution</h3>
+          <div class="chart-wrap"><canvas id="chart-threat"></canvas></div>
+        </div>
+        <div class="stats-card stats-card-2col counters">
+          <h3>Session Counters</h3>
+          <div class="counter-grid" id="counter-grid">
+            <div class="counter-item"><span class="cnt-val" id="cnt-total">0</span><span class="cnt-lbl">Packets</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-alerts">0</span><span class="cnt-lbl">Alerts</span></div>
+            <div class="counter-item"><span class="cnt-val cnt-bytes" id="cnt-bytes">0 B</span><span class="cnt-lbl">Total Bytes</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-bps">0 B/s</span><span class="cnt-lbl">Avg Bandwidth</span></div>
+            <div class="counter-item cnt-low"><span class="cnt-val" id="cnt-threat-low">0</span><span class="cnt-lbl">Low</span></div>
+            <div class="counter-item cnt-med"><span class="cnt-val" id="cnt-threat-med">0</span><span class="cnt-lbl">Medium</span></div>
+            <div class="counter-item cnt-high"><span class="cnt-val" id="cnt-threat-high">0</span><span class="cnt-lbl">High</span></div>
+            <div class="counter-item cnt-crit"><span class="cnt-val" id="cnt-threat-crit">0</span><span class="cnt-lbl">Critical</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-tcp">0</span><span class="cnt-lbl">TCP</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-udp">0</span><span class="cnt-lbl">UDP</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-http">0</span><span class="cnt-lbl">HTTP</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-dns">0</span><span class="cnt-lbl">DNS</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-tls">0</span><span class="cnt-lbl">TLS</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-ssh">0</span><span class="cnt-lbl">SSH</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-icmp">0</span><span class="cnt-lbl">ICMP</span></div>
+            <div class="counter-item"><span class="cnt-val" id="cnt-arp">0</span><span class="cnt-lbl">ARP</span></div>
+          </div>
+        </div>
+
+        <!-- Row 3: Full-width Dataset Report -->
+        <div class="stats-card wide rpt-card" id="rpt-card">
+          <div class="rpt-header">
+            <div class="rpt-title-row">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" style="color:var(--accent);flex-shrink:0"><path d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/></svg>
+              <span class="rpt-title">CICIDS 2017/2018 Training Dataset Report</span>
+              <span class="rpt-badge rpt-badge-green">UNIFIED &amp; BALANCED</span>
+              <span class="rpt-badge">200 ESTIMATORS</span>
+              <span class="rpt-badge">78 FEATURES</span>
+            </div>
+            <div class="rpt-summary-row" id="rpt-summary-row">
+              <div class="rpt-sum"><span class="rpt-sum-val">916,666</span><span class="rpt-sum-lbl">Training Samples</span></div>
+              <div class="rpt-sum"><span class="rpt-sum-val">27</span><span class="rpt-sum-lbl">Attack Classes</span></div>
+              <div class="rpt-sum rpt-sum-attack"><span class="rpt-sum-val">60%</span><span class="rpt-sum-lbl">Attack Traffic</span></div>
+              <div class="rpt-sum rpt-sum-benign"><span class="rpt-sum-val">40%</span><span class="rpt-sum-lbl">Benign Traffic</span></div>
+              <div class="rpt-sum"><span class="rpt-sum-val">78</span><span class="rpt-sum-lbl">Features</span></div>
+              <div class="rpt-sum"><span class="rpt-sum-val">Random Forest</span><span class="rpt-sum-lbl">Algorithm</span></div>
+            </div>
+          </div>
+          <div class="rpt-body">
+            <div class="rpt-chart-col">
+              <div class="rpt-chart-title">Top Attack Classes (Training Distribution)</div>
+              <div class="rpt-chart-wrap"><canvas id="chart-dataset"></canvas></div>
+            </div>
+            <div class="rpt-table-col">
+              <div class="rpt-table-title">All 27 Classes</div>
+              <div class="rpt-table-wrap">
+                <table class="rpt-table" id="rpt-table">
+                  <thead><tr><th>#</th><th>Class Name</th><th>Count</th><th>%</th></tr></thead>
+                  <tbody id="rpt-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Classifier Tab -->
+    <div class="tab-content" id="tab-classifier">
+      <div class="clf2-wrap">
+
+        <!-- Header bar -->
+        <div class="clf2-header">
+          <div class="clf2-header-left">
+            <span class="clf2-header-icon">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M12 2a10 10 0 100 20A10 10 0 0012 2zm-1 14.5v-5l-2 1.5V11l3-2 3 2v2l-2-1.5v5h-2z"/></svg>
+            </span>
+            <span class="clf2-header-title">ML Traffic Classifier</span>
+            <span class="clf2-header-badge">CICIDS 2017/2018</span>
+          </div>
+          <div class="clf2-header-right">
+            <span class="clf2-status-dot" id="clf2-status-dot"></span>
+            <span class="clf2-status-text" id="clf2-status-text">Loading model info&hellip;</span>
+          </div>
+        </div>
+
+        <!-- Body: two columns -->
+        <div class="clf2-body">
+
+          <!-- Left column: inputs -->
+          <div class="clf2-inputs-col">
+            <div class="clf2-col-title">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M3 17h18v2H3zm0-7h18v2H3zm0-7h18v2H3z"/></svg>
+              Network Flow Features
+            </div>
+            <div id="classifier-form-wrap" class="clf2-form-wrap">
+              <div class="empty-state">Loading features&hellip;</div>
+            </div>
+
+            <!-- CSV toolbar -->
+            <div class="clf2-csv-bar">
+              <label class="clf-csv-label" title="Load a CICIDS-format CSV to update feature defaults">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm-1 1.5L18.5 9H13V3.5zM8 17v-2h8v2H8zm0-4v-2h8v2H8z"/></svg>
+                Load CSV
+                <input type="file" id="clf-csv-input" accept=".csv" style="display:none" onchange="classifierLoadCSV(this)">
+              </label>
+              <span class="clf-csv-name" id="clf-csv-name">Using training-set defaults</span>
+            </div>
+
+            <!-- Upload progress -->
+            <div class="clf-upload-progress" id="clf-upload-progress" style="display:none">
+              <div class="clf-prog-header">
+                <span class="clf-prog-filename" id="clf-prog-filename"></span>
+                <span class="clf-prog-status" id="clf-prog-status"></span>
+              </div>
+              <div class="clf-prog-bar-wrap">
+                <div class="clf-prog-bar" id="clf-prog-bar"></div>
+              </div>
+              <div class="clf-prog-stats">
+                <span id="clf-prog-transferred"></span>
+                <span id="clf-prog-rows"></span>
+                <span id="clf-prog-remaining"></span>
+              </div>
+            </div>
+
+            <!-- Action buttons -->
+            <div class="clf2-actions">
+              <button class="btn-sm btn-accent clf2-analyze-btn" onclick="classifierPredict()">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                Analyze Traffic
+              </button>
+              <button class="btn-sm" onclick="classifierFillDefaults()">Load Defaults</button>
+              <button class="btn-sm" onclick="classifierClear()">Clear</button>
+            </div>
+
+            <!-- Classify the REAL captured traffic (live / simulation / opened pcap) -->
+            <div class="clf2-report-bar">
+              <button class="btn-sm btn-accent2 clf2-livebtn" onclick="classifierAnalyzeTraffic()" title="Reassemble captured packets into flows and classify them with the ML model">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M3 13h2l3 7 4-16 3 9h2l2-3h3"/></svg>
+                Classify Captured Traffic
+              </button>
+              <span class="clf-report-hint">Runs the model on live / simulated / opened-pcap flows</span>
+            </div>
+
+            <!-- When a CSV is loaded, "Analyze Traffic" auto-generates the Word report -->
+            <div class="clf2-report-bar" id="clf-report-hint-bar" style="display:none">
+              <span class="clf-report-hint">📄 A CSV is loaded — clicking <b>Analyze Traffic</b> will generate a Gemini-authored Word report; you'll be asked where to save it.</span>
+            </div>
+          </div>
+
+          <!-- Right column: result + model info -->
+          <div class="clf2-result-col">
+
+            <!-- Prediction result box -->
+            <div class="clf2-result-box" id="clf2-result-box">
+              <div class="clf2-result-idle" id="clf2-result-idle">
+                <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor" style="opacity:0.25"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                <div class="clf2-idle-text">Fill features &amp; click Analyze</div>
+              </div>
+              <div class="clf2-result-content" id="clf2-result-content" style="display:none">
+                <div class="clf2-pred-label" id="clf2-pred-label"></div>
+                <div class="clf2-pred-class" id="clf2-pred-class"></div>
+                <div class="clf2-prob-section" id="clf2-prob-section" style="display:none">
+                  <div class="clf2-prob-title" id="clf2-prob-title">Top Probabilities</div>
+                  <div id="prob-bars"></div>
+                </div>
+                <!-- Per-flow results (populated by "Classify Captured Traffic") -->
+                <div class="clf2-flows-section" id="clf2-flows-section" style="display:none">
+                  <div class="clf2-prob-title">Detected Flows</div>
+                  <div class="clf2-flows" id="clf2-flows"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Model information -->
+            <div class="clf2-model-info">
+              <div class="clf2-info-title">
+                <svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor"><path d="M12 2a10 10 0 100 20A10 10 0 0012 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                Model Information
+              </div>
+              <div class="clf2-info-grid" id="clf2-info-grid">
+                <span class="clf2-info-k">Dataset</span><span class="clf2-info-v">CICIDS 2017 / 2018</span>
+                <span class="clf2-info-k">Algorithm</span><span class="clf2-info-v">Random Forest</span>
+                <span class="clf2-info-k">Estimators</span><span class="clf2-info-v">200</span>
+                <span class="clf2-info-k">Features</span><span class="clf2-info-v">78</span>
+                <span class="clf2-info-k">Classes</span><span class="clf2-info-v">27</span>
+                <span class="clf2-info-k">Training Rows</span><span class="clf2-info-v">916,666</span>
+              </div>
+              <div class="clf2-classes-hdr">Attack Categories</div>
+              <div class="clf2-classes-list" id="clf2-classes-list">
+                <span class="clf2-class-tag clf2-tag-benign">Benign</span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Rules Tab -->
+    <div class="tab-content" id="tab-rules">
+      <div class="rules-panel">
+        <div class="rules-controls">
+          <button class="btn-sm" onclick="loadRulesTab()">Refresh</button>
+          <button class="btn-sm btn-accent" onclick="showModal('modal-rules')">Validate Rule</button>
+        </div>
+        <div class="rules-validator">
+          <label>Validate a rule:</label>
+          <input type="text" id="rule-validate-input" placeholder="TCP any:any -> any:any *" />
+          <button class="btn-sm btn-accent" onclick="validateRuleInline()">Check</button>
+          <span id="rule-validate-result"></span>
+        </div>
+        <div id="rules-list"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Right: Alerts + Charts sidebar -->
+  <div class="sidebar" id="sidebar">
+
+    <!-- Threat Indicator -->
+    <div class="sidebar-section threat-widget">
+      <div class="sw-label">System Threat Level</div>
+      <div class="threat-bar">
+        <div class="threat-level" id="threat-level-display">LOW</div>
+        <div class="threat-meter">
+          <div class="tm-seg tm-low">LOW</div>
+          <div class="tm-seg tm-med">MED</div>
+          <div class="tm-seg tm-high">HIGH</div>
+          <div class="tm-seg tm-crit">CRIT</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Alerts -->
+    <div class="sidebar-section" id="panel-alerts">
+      <div class="sidebar-title">
+        <span>Live Alerts</span>
+        <span class="badge-pill" id="sb-alert-count">0</span>
+      </div>
+      <div class="sb-alerts-list" id="sb-alerts-list">
+        <div class="empty-state">No alerts detected</div>
+      </div>
+    </div>
+
+    <!-- Mini Charts -->
+    <div class="sidebar-section" id="panel-charts">
+      <div class="sidebar-title">Traffic Overview</div>
+      <div class="mini-chart-wrap"><canvas id="mini-chart-traffic"></canvas></div>
+      <div class="mini-proto-list" id="mini-proto-list"></div>
+    </div>
+
+    <!-- Security Detectors -->
+    <div class="sidebar-section" id="panel-detectors">
+      <div class="sidebar-title">
+        <span>Security Detectors</span>
+        <span class="badge-pill" id="sb-detectors-count">0</span>
+      </div>
+      <div class="sb-detectors-list" id="sb-detectors-list">
+        <div class="empty-state">No detectors loaded</div>
+      </div>
+    </div>
+
+    <!-- Active Rules -->
+    <div class="sidebar-section">
+      <div class="sidebar-title">
+        <span>Active Rules</span>
+        <span class="badge-pill" id="sb-rules-count">0</span>
+      </div>
+      <div class="sb-rules-list" id="sb-rules-list">
+        <div class="empty-state">No rules loaded</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ─── Status Bar ────────────────────────────────────────────────────────── -->
+<div class="statusbar">
+  <div class="sb-item"><span class="sb-icon">📡</span><span id="sb-interface">eth0 (simulated)</span></div>
+  <div class="sb-sep"></div>
+  <div class="sb-item">Packets: <strong id="sb-packets">0</strong></div>
+  <div class="sb-sep"></div>
+  <div class="sb-item">Filtered: <strong id="sb-filtered">0</strong></div>
+  <div class="sb-sep"></div>
+  <div class="sb-item">Alerts: <strong id="sb-alerts">0</strong></div>
+  <div class="sb-sep"></div>
+  <div class="sb-item">Detectors: <strong id="sb-active-detectors">0</strong></div>
+  <div class="sb-sep"></div>
+  <div class="sb-item">Rules: <strong id="sb-selected-rules">default.rules</strong></div>
+  <div class="sb-sep"></div>
+  <div class="sb-item"><span id="sb-status">Idle — press Start to begin capture</span></div>
+  <div class="sb-spacer"></div>
+  <div class="sb-item" id="sb-filter-active"></div>
+  <div class="sb-sep"></div>
+  <div class="sb-item">µIDS v1.0</div>
+</div>
+
+<!-- ─── Rules Modal ───────────────────────────────────────────────────────── -->
+<div class="modal-overlay" id="modal-rules" onclick="closeModal('modal-rules')">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <span>Rule Validator</span>
+      <button class="modal-close" onclick="closeModal('modal-rules')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-desc">Enter a rule string to validate it against the IDS rule syntax.</p>
+      <div class="modal-rule-format">
+        <code>PROTO [!]IP|any:[!]PORT(RANGE)|any &lt;&gt;|-&gt; [!]IP|any:[!]PORT(RANGE)|any *</code>
+      </div>
+      <div class="modal-input-row">
+        <input type="text" id="modal-rule-input" placeholder="e.g. TCP 192.168.0.1:any -> any:80 *" />
+        <button class="btn-accent" onclick="validateRule()">Validate</button>
+      </div>
+      <div id="modal-rule-result" class="modal-result"></div>
+      <div class="modal-examples">
+        <div class="me-label">Examples:</div>
+        <div class="me-item" onclick="useExample(this)">TCP 192.168.0.1:any -&gt; any:80 *</div>
+        <div class="me-item" onclick="useExample(this)">ICMP 1.1.1.1:any -&gt; 192.168.178.22:any *</div>
+        <div class="me-item" onclick="useExample(this)">UDP any:[500-510] -&gt; any:any *</div>
+        <div class="me-item" onclick="useExample(this)">TCP !192.168.0.1:[0-8000] &lt;&gt; 127.0.0.1:!8080 *</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ─── Interface Picker Modal (Wireshark-style) ──────────────────────────── -->
+<div class="modal-overlay" id="modal-iface" onclick="closeModal('modal-iface')">
+  <div class="modal modal-iface" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <span>Capture Interfaces</span>
+      <button class="modal-close" onclick="closeModal('modal-iface')">✕</button>
+    </div>
+    <div class="modal-body" style="padding: 0;">
+      <div class="iface-banner" id="iface-banner" style="display:none;">
+        <span class="ib-icon">ℹ</span>
+        <div class="ib-text">
+          <b>Only sandbox interfaces are visible.</b>
+          To capture Wi-Fi or Ethernet traffic, run the dashboard locally with elevated privileges:
+          <code>sudo LIVE_CAPTURE=1 python3 app.py</code> (Linux/macOS) or
+          <code>$env:LIVE_CAPTURE=1; python app.py</code> in an Administrator PowerShell (Windows + Npcap).
+        </div>
+      </div>
+      <div class="iface-filterbar">
+        <input type="text" id="iface-filter" placeholder="Search interfaces…"
+               oninput="filterInterfaceList(this.value)" />
+        <button class="btn-link" onclick="loadInterfaces(true)" title="Refresh">↻</button>
+      </div>
+      <div class="iface-table-head">
+        <div class="ith-name">Interface</div>
+        <div class="ith-traffic">Traffic</div>
+        <div class="ith-addrs">Addresses</div>
+      </div>
+      <div class="iface-list" id="iface-list">
+        <div class="iface-empty">Loading interfaces…</div>
+      </div>
+      <div class="iface-footer">
+        <span id="iface-count" class="iface-count">—</span>
+        <button class="btn-accent" id="iface-start-btn" onclick="confirmInterfaceSelection()" disabled>
+          Start Capture
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ─── Notification Toast ────────────────────────────────────────────────── -->
+<div id="toast-container"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
