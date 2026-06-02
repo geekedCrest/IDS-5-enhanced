@@ -33,6 +33,58 @@ In live mode the dashboard captures every Ethernet frame on the chosen interface
 
 > Live capture cannot run in cloud sandboxes (including Replit) because raw L2 sockets need root and a real interface. Use it on a local machine.
 
+### Live capture on Windows
+
+On Windows, live capture sniffs real packets off your network adapter instead of the simulation. It needs the **Npcap** driver and an **Administrator** terminal.
+
+**1. Install Npcap** (Scapy cannot capture on Windows without it)
+
+- Download from **https://npcap.com/#download**
+- Run the installer and tick **"Install Npcap in WinPcap API-compatible Mode"**.
+
+**2. Set up the project** (first time only), in PowerShell:
+
+```powershell
+cd C:\path\to\IDS-5-enhanced
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+> The ML model files are **not** in the repo (too large for GitHub). Place `cyber_rf_model.joblib`, `cyber_scaler.joblib`, and `cyber_encoder.joblib` in the `uploaded/` folder, and put your Google Gemini API key in `gemini_api_key.txt` in the project root (only needed for the Word report).
+
+**3. Start the dashboard as Administrator**
+
+Right-click **PowerShell → Run as administrator** (raw packet capture requires elevation), then:
+
+```powershell
+cd C:\path\to\IDS-5-enhanced
+.\.venv\Scripts\Activate.ps1
+$env:LIVE_CAPTURE = "1"
+python app.py
+```
+
+(You can also leave `LIVE_CAPTURE` unset and just flip the toggle in the UI — see step 5.)
+
+**4. Open the dashboard:** http://localhost:5000
+
+**5. Choose your interface and go live**
+
+- Click the **interface selector** (top-right of the toolbar) and pick your real adapter (Wi-Fi or Ethernet).
+- Click **Live Sniffer** (the toggle next to *Simulation*) to switch from simulation to live capture.
+- Click **Start**.
+
+Real packets from your NIC now flow into the Packets table, and alerts fire when they match the loaded rules.
+
+**Windows troubleshooting**
+
+| Symptom | Fix |
+| --- | --- |
+| `Interface 'eth0' not found` | `eth0` is the default Linux name — pick a real adapter in the interface selector. |
+| `Permission denied` | The terminal isn't elevated — relaunch PowerShell as **Administrator**. |
+| No packets appear | Confirm Npcap is installed (WinPcap-compatible mode), the right adapter is selected, and you clicked **Start** in **Live Sniffer** mode. Generate traffic (e.g. open a website). |
+| `winpcap is not installed` / scapy import warning | (Re)install Npcap from npcap.com. |
+
 ### CLI mode (terminal-only, no dashboard)
 
 ```bash

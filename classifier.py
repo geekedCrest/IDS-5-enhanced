@@ -159,18 +159,30 @@ def predict_single(row_dict):
     return result
 
 
-def predict_batch(rows):
+def predict_batch(rows, defaults=None):
     """Classify many feature dicts at once. `rows` is a list of {feature_name: value}.
     Returns a list of {'prediction': str, 'confidence': float} aligned with `rows`.
-    Missing features are filled with the scaler's training mean (same as predict_single).
+
+    `defaults` (optional) is a {feature_name: value} dict — e.g. medians from an
+    uploaded CSV — used as the BASELINE for features not present in a row. Any
+    feature not covered by `defaults` falls back to the scaler's training mean.
     """
     _load_model()
     if not rows:
         return []
-    means = [_scaler.mean_[i] for i in range(len(_feat_cols))]
     col_idx = {col: i for i, col in enumerate(_feat_cols)}
 
-    X = np.tile(np.array(means, dtype=float), (len(rows), 1))
+    base = [float(_scaler.mean_[i]) for i in range(len(_feat_cols))]
+    if defaults:
+        for key, val in defaults.items():
+            i = col_idx.get(key)
+            if i is not None and val not in (None, ''):
+                try:
+                    base[i] = float(val)
+                except (ValueError, TypeError):
+                    pass
+
+    X = np.tile(np.array(base, dtype=float), (len(rows), 1))
     for r, row_dict in enumerate(rows):
         for key, val in row_dict.items():
             i = col_idx.get(key)
@@ -199,6 +211,58 @@ def _norm_col(name):
     """Normalise a CSV column name to internal snake_case (e.g. 'Dst Port' → 'dst_port')."""
     import re
     return re.sub(r'[\s/\-\.]+', '_', name.strip().lower()).strip('_')
+
+
+def dataset_report_from_csv(file_stream, filename=''):
+    """Compute a dataset-composition report from an uploaded CSV (reads the label
+    column fully to get the real per-class distribution). Mirrors the shape of the
+    static /api/dataset-report payload so the Statistics panel can render it."""
+    file_stream.seek(0)
+    header = pd.read_csv(file_stream, nrows=0)
+    cols = list(header.columns)
+
+    label_col = None
+    for c in cols:
+        if c.strip().lower() in ('label', 'predicted_label', 'class', 'attack', 'category'):
+            label_col = c
+            break
+
+    file_stream.seek(0)
+    if label_col is None:
+        # No labels — just report row/feature counts.
+        first = pd.read_csv(file_stream, usecols=[cols[0]], low_memory=False, on_bad_lines='skip')
+        total = int(len(first))
+        return {
+            'success': True, 'source': 'csv', 'has_labels': False,
+            'dataset': filename or 'Uploaded CSV', 'total_samples': total,
+            'n_features': len(cols), 'n_classes': 0,
+            'benign_count': 0, 'benign_pct': 0.0, 'attack_count': 0, 'attack_pct': 0.0,
+            'algorithm': 'Random Forest', 'estimators': 200, 'classes': [],
+        }
+
+    series = pd.read_csv(file_stream, usecols=[label_col], low_memory=False,
+                         on_bad_lines='skip')[label_col].astype(str).str.strip()
+    vc = series.value_counts()
+    total = int(vc.sum()) or 1
+
+    classes, benign_count = [], 0
+    for name, cnt in vc.items():
+        cnt = int(cnt)
+        is_benign = name.lower() in ('benign', 'normal', 'benign traffic')
+        if is_benign:
+            benign_count += cnt
+        classes.append({'name': name, 'count': cnt,
+                        'pct': round(cnt / total * 100, 4), 'is_benign': is_benign})
+    attack_count = total - benign_count
+
+    return {
+        'success': True, 'source': 'csv', 'has_labels': True,
+        'dataset': filename or 'Uploaded CSV', 'total_samples': total,
+        'n_features': max(0, len(cols) - 1), 'n_classes': len(classes),
+        'benign_count': benign_count, 'benign_pct': round(benign_count / total * 100, 2),
+        'attack_count': attack_count, 'attack_pct': round(attack_count / total * 100, 2),
+        'algorithm': 'Random Forest', 'estimators': 200, 'classes': classes,
+    }
 
 
 def feature_info_from_csv(file_stream, nrows=2000):

@@ -26,11 +26,11 @@ const socket = io();
 
 socket.on('connect', () => {
   console.log('[WS] Connected');
-  toast('info', '🔌 Connected', 'Dashboard connected to IDS server');
+  toast('info', 'Connected', 'Dashboard connected to IDS server');
 });
 
 socket.on('disconnect', () => {
-  toast('high', '⚠ Disconnected', 'Lost connection to IDS server');
+  toast('high', 'Disconnected', 'Lost connection to IDS server');
   setCaptureBtns(false, false);
 });
 
@@ -67,7 +67,7 @@ socket.on('detector_status_changed', (data) => {
   if (data.status) {
     updateStatus(data.status);
   }
-  toast('info', '🛡 Detector Updated', `${data.id} is now ${data.enabled ? 'Enabled' : 'Disabled'}`);
+  toast('info', 'Detector Updated', `${data.id} is now ${data.enabled ? 'Enabled' : 'Disabled'}`);
 });
 
 socket.on('packet', (pkt) => {
@@ -156,14 +156,14 @@ socket.on('rules_loaded', (data) => {
     const rfd = el('rules-file-dropdown');
     if (rfd) rfd.value = data.selected_rules_file;
   }
-  toast('info', '📜 Rules Loaded', `${data.count} rules loaded`);
+  toast('info', 'Rules Loaded', `${data.count} rules loaded`);
   if (el('tab-rules').classList.contains('active')) {
     loadRulesTab();
   }
 });
 
 socket.on('capture_error', (data) => {
-  toast('high', '⚠ Capture Error', data.error || 'Failed to capture packets');
+  toast('high', 'Capture Error', data.error || 'Failed to capture packets');
   setCaptureBtns(false, false);
 });
 
@@ -356,8 +356,7 @@ function addAlert(alert) {
 
 function showAlertToast(alert) {
   const level = (alert.threat || 'MEDIUM').toLowerCase();
-  const icons = { critical: '🔴', high: '🟠', medium: '🟡', low: '🟢' };
-  toast(level, `${icons[level] || '⚠'} ${alert.type || 'Alert'}`,
+  toast(level, alert.type || 'Alert',
     `${alert.src} → ${alert.dst} | ${alert.rule || alert.info || ''}`);
 }
 
@@ -730,21 +729,48 @@ function updateCounters() {
 }
 
 // ─── Dataset Report ───────────────────────────────────────────────────────────
-async function loadDatasetReport() {
-  if (state.datasetReportLoaded) return;
+async function loadDatasetReport(force) {
+  if (state.datasetReportLoaded && !force) return;
   try {
     const r = await fetch('/api/dataset-report');
     const d = await r.json();
-    if (!d.success) return;
+    if (!d || d.success === false) return;
     state.datasetReportLoaded = true;
-    _renderDatasetTable(d.classes);
-    _renderDatasetChart(d.classes);
+    applyDatasetReport(d);
   } catch (e) { console.error('dataset-report error', e); }
+}
+
+// Update the whole Statistics dataset panel — from the static default OR an
+// uploaded CSV's actual composition.
+function applyDatasetReport(d) {
+  if (!d) return;
+  const isCsv = d.source === 'csv';
+  setEl('rpt-title', isCsv ? (d.dataset + ' — Dataset Report')
+                           : 'CICIDS 2017/2018 Training Dataset Report');
+  setEl('rpt-sum-samples', (d.total_samples || 0).toLocaleString());
+  setEl('rpt-sum-samples-lbl', isCsv ? 'Rows' : 'Training Samples');
+  setEl('rpt-sum-classes', d.n_classes || 0);
+  setEl('rpt-sum-attack', (d.attack_pct != null ? d.attack_pct : 0) + '%');
+  setEl('rpt-sum-benign', (d.benign_pct != null ? d.benign_pct : 0) + '%');
+  setEl('rpt-sum-features', d.n_features || 0);
+  setEl('rpt-badge-features', (d.n_features || 0) + ' FEATURES');
+  setEl('rpt-badge-balance', isCsv ? 'USER CSV' : 'UNIFIED & BALANCED');
+  setEl('rpt-table-title', 'All ' + (d.n_classes || 0) + ' Classes');
+  setEl('rpt-chart-title', isCsv ? 'Top Classes (CSV Distribution)'
+                                 : 'Top Attack Classes (Training Distribution)');
+  _renderDatasetTable(d.classes || []);
+  _renderDatasetChart(d.classes || []);
 }
 
 function _renderDatasetTable(classes) {
   const tbody = el('rpt-tbody');
   if (!tbody) return;
+  if (!classes.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty-state" style="padding:16px">' +
+      'No label column found in this CSV — class distribution unavailable.</td></tr>';
+    return;
+  }
+  const maxPct = Math.max.apply(null, classes.map(c => c.pct || 0)) || 1;
   tbody.innerHTML = classes.map((c, i) => `
     <tr class="${c.is_benign ? 'rpt-row-benign' : ''}">
       <td class="rpt-td-num">${i + 1}</td>
@@ -752,7 +778,7 @@ function _renderDatasetTable(classes) {
       <td class="rpt-td-cnt">${c.count.toLocaleString()}</td>
       <td class="rpt-td-pct">
         <div class="rpt-bar-wrap">
-          <div class="rpt-bar ${c.is_benign ? 'rpt-bar-benign' : 'rpt-bar-attack'}" style="width:${Math.min(c.pct / 40 * 100, 100)}%"></div>
+          <div class="rpt-bar ${c.is_benign ? 'rpt-bar-benign' : 'rpt-bar-attack'}" style="width:${Math.min((c.pct / maxPct) * 100, 100)}%"></div>
           <span class="rpt-bar-lbl">${c.pct >= 0.001 ? c.pct.toFixed(c.pct >= 1 ? 2 : 4) : '<0.001'}%</span>
         </div>
       </td>
@@ -762,7 +788,9 @@ function _renderDatasetTable(classes) {
 
 function _renderDatasetChart(classes) {
   const canvas = el('chart-dataset');
-  if (!canvas || state.charts.dataset) return;
+  if (!canvas) return;
+  if (state.charts.dataset) { state.charts.dataset.destroy(); state.charts.dataset = null; }
+  if (!classes.length) return;
   const top12 = classes.slice(0, 12);
   const colors = top12.map(c => c.is_benign
     ? 'rgba(63,185,80,0.82)'
@@ -910,7 +938,7 @@ async function loadInterfaces(showToast = false) {
     }
     renderInterfaceList(_interfaces);
     updateSandboxBanner();
-    if (showToast) toast('info', '↻ Refreshed', `${_interfaces.length} interfaces found`);
+    if (showToast) toast('info', 'Refreshed', `${_interfaces.length} interfaces found`);
   } catch (e) {
     console.warn('Could not load interfaces:', e);
     el('iface-current-label').textContent = 'no interfaces';
@@ -1138,7 +1166,7 @@ function setInterface(name) {
     _interfaces.forEach(x => x.active = (x.name === name));
     const displayName = i.friendly_name || i.name;
     el('iface-current-label').textContent = i.ip ? `${displayName} (${i.ip})` : displayName;
-    toast('info', '📡 Interface Changed', `Now monitoring: ${displayName}`);
+    toast('info', 'Interface Changed', `Now monitoring: ${displayName}`);
   }
 }
 
@@ -1148,22 +1176,22 @@ function setInterface(name) {
 // file with scapy, classifies each packet against the loaded rules, and loads the
 // results into the view (freezing the background simulation).
 function openFile() {
-  toast('info', '📂 Open Capture', 'Pick a .pcap file when the dialog appears…');
+  toast('info', 'Open Capture', 'Pick a .pcap file when the dialog appears…');
   fetch('/api/capture/open-pcap', { method: 'POST' })
     .then(r => r.json())
     .then(data => {
       if (data.success) {
         const extra = data.truncated ? ' (first ' + data.count + ' of ' + data.total_in_file + ')' : '';
-        toast('success', '📂 Capture Loaded',
+        toast('success', 'Capture Loaded',
               data.filename + ' — ' + data.count + ' packets, ' + data.alerts + ' alerts' + extra);
         // packets are reloaded by the 'pcap_loaded' socket handler
       } else if (data.cancelled) {
-        toast('info', '📂 Open Capture', 'Open cancelled.');
+        toast('info', 'Open Capture', 'Open cancelled.');
       } else {
-        toast('error', '📂 Open Capture', data.error || 'Could not open capture');
+        toast('error', 'Open Capture', data.error || 'Could not open capture');
       }
     })
-    .catch(() => toast('error', '📂 Open Capture', 'Request failed'));
+    .catch(() => toast('error', 'Open Capture', 'Request failed'));
 }
 
 let classifierFeatures = null;
@@ -1212,6 +1240,27 @@ function updateClassesList(classes) {
   });
 }
 
+// Update the Model Information panel from an uploaded CSV's composition (dataset
+// name, rows, classes, features, category list). Algorithm/estimators stay constant
+// (they describe the model, not the CSV).
+function applyModelInfo(d) {
+  if (!d) return;
+  const isCsv = d.source === 'csv';
+  const name = d.dataset || 'CICIDS 2017 / 2018';
+  setEl('clf2-iv-dataset', isCsv ? name : 'CICIDS 2017 / 2018');
+  setEl('clf2-iv-algo', d.algorithm || 'Random Forest');
+  setEl('clf2-iv-est', d.estimators || 200);
+  setEl('clf2-iv-features', d.n_features != null ? d.n_features : 78);
+  setEl('clf2-iv-classes', d.n_classes != null ? d.n_classes : 27);
+  setEl('clf2-iv-rows', (d.total_samples != null ? d.total_samples : 916666).toLocaleString());
+  setEl('clf2-iv-rows-k', isCsv ? 'Rows' : 'Training Rows');
+  setEl('clf2-classes-hdr', isCsv ? 'Classes in CSV' : 'Attack Categories');
+  setEl('clf2-header-badge', isCsv ? (name.length > 24 ? name.slice(0, 24) + '…' : name) : 'CICIDS 2017/2018');
+  setEl('clf2-status-text', 'Random Forest · ' + (d.n_features != null ? d.n_features : 78) +
+        ' features · ' + (d.n_classes != null ? d.n_classes : 27) + ' classes');
+  if (d.classes && d.classes.length) updateClassesList(d.classes.map(c => c.name));
+}
+
 function renderClassifierForm(features) {
   const wrap = document.getElementById('classifier-form-wrap');
   wrap.innerHTML = '';
@@ -1237,6 +1286,21 @@ function renderClassifierForm(features) {
 
 function classifierPredict() {
   if (!classifierFeatures) { toast('error', 'Classifier', 'Features not loaded yet'); return; }
+
+  // If a CSV is loaded, classify the WHOLE CSV (every row) and generate the report.
+  // The result box then shows the full-file breakdown, and a Save dialog appears
+  // for the Word report.
+  if (classifierCSVFile) {
+    const idle    = document.getElementById('clf2-result-idle');
+    const content = document.getElementById('clf2-result-content');
+    const box     = document.getElementById('clf2-result-box');
+    if (idle)    idle.style.display    = 'none';
+    if (content) content.style.display = 'none';
+    if (box)     box.className         = 'clf2-result-box clf2-result-working';
+    toast('info', 'Classify CSV', 'Classifying the whole CSV & generating the Word report…');
+    generateReportFromFile(classifierCSVFile);
+    return;
+  }
 
   const inputs = document.querySelectorAll('#classifier-form-wrap .clf-input');
   const row = {};
@@ -1310,21 +1374,116 @@ function classifierPredict() {
     });
 }
 
+// ─── Report-generation progress ────────────────────────────────────────────────
+socket.on('report_progress', (d) => {
+  if (!d) return;
+  updateGenProgress(d.pct, d.message);
+});
+
+let _genCreep = null;
+function showGenProgress() {
+  const gen = el('clf2-gen'), idle = el('clf2-result-idle'), content = el('clf2-result-content');
+  if (idle) idle.style.display = 'none';
+  if (content) content.style.display = 'none';
+  if (gen) gen.style.display = 'flex';
+  const bar = el('clf2-gen-bar');
+  if (bar) bar.classList.add('gen-active');
+  updateGenProgress(6, 'Starting…');
+}
+function updateGenProgress(pct, msg) {
+  const bar = el('clf2-gen-bar'), p = el('clf2-gen-pct'), m = el('clf2-gen-msg');
+  if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+  if (p) p.textContent = Math.round(Math.max(0, Math.min(100, pct))) + '%';
+  if (m && msg) m.textContent = msg;
+  // During the long Gemini phase (~58%), creep slowly toward 86% so it feels alive.
+  if (_genCreep) { clearInterval(_genCreep); _genCreep = null; }
+  if (pct >= 50 && pct < 88) {
+    let cur = pct;
+    _genCreep = setInterval(() => {
+      cur = Math.min(86, cur + 0.6);
+      const b = el('clf2-gen-bar'), pp = el('clf2-gen-pct');
+      if (b) b.style.width = cur + '%';
+      if (pp) pp.textContent = Math.round(cur) + '%';
+      if (cur >= 86 && _genCreep) { clearInterval(_genCreep); _genCreep = null; }
+    }, 700);
+  }
+}
+function hideGenProgress() {
+  if (_genCreep) { clearInterval(_genCreep); _genCreep = null; }
+  const gen = el('clf2-gen');
+  if (gen) gen.style.display = 'none';
+}
+
+// Render the captured-traffic statistics grid + protocol / port / talker breakdowns.
+function renderTrafficStats(d) {
+  const grid = el('clf2-stats-grid');
+  if (!grid) return;
+  const num = v => (v == null ? 0 : v).toLocaleString();
+  const cards = [
+    ['Total Flows', num(d.total_flows), ''],
+    ['Packets', num(d.total_packets), ''],
+    ['Attacks', num(d.attack_flows), d.attack_flows > 0 ? 'stat-attack' : ''],
+    ['Benign', num(d.benign_flows), 'stat-benign'],
+    ['Attack Rate', (d.attack_pct || 0) + '%', d.attack_flows > 0 ? 'stat-attack' : ''],
+    ['Avg Confidence', (d.avg_confidence || 0) + '%', ''],
+    ['Unique Sources', num(d.unique_sources), ''],
+    ['Dst Ports', num(d.unique_dst_ports), ''],
+  ];
+  let html = cards.map(([lbl, val, cls]) =>
+    `<div class="clf2-stat ${cls}"><span class="clf2-stat-val">${val}</span><span class="clf2-stat-lbl">${lbl}</span></div>`
+  ).join('');
+
+  const chips = (arr, fmt) => (arr || []).map(fmt).join('');
+  const protoRow = chips(d.protocols, ([p, n]) => `<span class="clf2-chip">${escHtml(String(p))} <b>${n}</b></span>`);
+  const portRow  = chips(d.top_ports, ([p, n]) => `<span class="clf2-chip">:${p} <b>${n}</b></span>`);
+  const talkRow  = chips(d.top_talkers, ([s, n]) => `<span class="clf2-chip">${escHtml(String(s))} <b>${n}</b></span>`);
+
+  html += `<div class="clf2-stat-rows">
+    ${protoRow ? `<div class="clf2-stat-row"><span class="clf2-sr-lbl">Protocols</span><span class="clf2-sr-vals">${protoRow}</span></div>` : ''}
+    ${portRow ? `<div class="clf2-stat-row"><span class="clf2-sr-lbl">Top Ports</span><span class="clf2-sr-vals">${portRow}</span></div>` : ''}
+    ${talkRow ? `<div class="clf2-stat-row"><span class="clf2-sr-lbl">Top Sources</span><span class="clf2-sr-vals">${talkRow}</span></div>` : ''}
+  </div>`;
+
+  grid.innerHTML = html;
+  grid.style.display = 'block';
+}
+
 // Classify the REAL captured traffic: ask the server to reassemble flows from the
-// live / simulated / opened-pcap packets and run them through the ML model.
+// live / simulated / opened-pcap packets and run them through the ML model,
+// using the uploaded CSV's features as the baseline. A CSV is required.
 function classifierAnalyzeTraffic() {
+  if (!classifierCSVFile) {
+    toast('error', 'Load CSV first',
+          'Upload a CSV (Load CSV) so the captured traffic is classified using its features.');
+    return;
+  }
   const idle    = document.getElementById('clf2-result-idle');
   const content = document.getElementById('clf2-result-content');
   const box     = document.getElementById('clf2-result-box');
   const btn     = document.querySelector('.clf2-livebtn');
-  if (idle)    idle.style.display    = 'none';
-  if (content) content.style.display = 'none';
-  if (box)     box.className         = 'clf2-result-box clf2-result-working';
+  if (box)     box.className = 'clf2-result-box';
   if (btn)     btn.classList.add('btn-disabled');
+  showGenProgress();   // live progress bar (driven by 'report_progress' socket events)
 
-  fetch('/api/classifier/analyze-traffic', { method: 'POST' })
+  // The feature form (populated from the CSV) is the classification baseline: any
+  // feature not measurable from a captured packet uses these values. Read whatever
+  // is currently in the form so the user can tweak it before classifying.
+  const defaults = {};
+  document.querySelectorAll('#classifier-form-wrap .clf-input').forEach(inp => {
+    const v = inp.value.trim();
+    if (v !== '') defaults[inp.dataset.field] = v;
+  });
+  toast('info', 'Classify Captured Traffic',
+        'Classifying captured flows with your CSV features & generating the Word report — choose where to save it.');
+
+  fetch('/api/classifier/traffic-report', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ defaults: defaults })
+  })
     .then(r => r.json())
     .then(data => {
+      hideGenProgress();
       if (box) box.className = 'clf2-result-box';
       if (btn) btn.classList.remove('btn-disabled');
       if (!data.success) {
@@ -1332,6 +1491,8 @@ function classifierAnalyzeTraffic() {
         toast('info', 'Classify Traffic', data.error);
         return;
       }
+
+      renderTrafficStats(data);   // the new statistics grid
 
       const hasAttacks = data.attack_flows > 0;
       const labelEl = document.getElementById('clf2-pred-label');
@@ -1387,8 +1548,16 @@ function classifierAnalyzeTraffic() {
       if (content) content.style.display = 'flex';
       toast(hasAttacks ? 'high' : 'success', 'Traffic Classified',
             data.total_flows + ' flows analyzed — ' + data.attack_flows + ' flagged as attacks');
+
+      // Word report on the captured-traffic classification
+      if (data.report_saved) {
+        toast('success', 'Word Report', 'Saved to ' + (data.saved_path || data.filename));
+      } else if (data.cancelled_report) {
+        toast('info', 'Word Report', 'Classification done — report save cancelled.');
+      }
     })
     .catch(() => {
+      hideGenProgress();
       if (box) box.className = 'clf2-result-box';
       if (btn) btn.classList.remove('btn-disabled');
       if (idle) idle.style.display = 'flex';
@@ -1495,6 +1664,14 @@ function classifierLoadCSV(input) {
     classifierCSVFile = file;   // remember it so "Analyze Traffic" can auto-build the report
     const hintBar = document.getElementById('clf-report-hint-bar');
     if (hintBar) hintBar.style.display = 'flex';
+    const liveBtn = document.querySelector('.clf2-livebtn');   // enable captured-traffic classify
+    if (liveBtn) liveBtn.classList.remove('btn-disabled');
+    // Update the Model Information panel + Statistics dataset panel from THIS CSV.
+    if (data.dataset_report) {
+      applyModelInfo(data.dataset_report);
+      state.datasetReportLoaded = false;
+      if (el('tab-stats') && el('tab-stats').classList.contains('active')) loadDatasetReport(true);
+    }
     renderClassifierForm(data.features);
     classifierFillDefaults();
     toast('success', 'CSV Loaded', file.name + ' — ' + data.count + ' features. Click Analyze Traffic to generate the report.');
@@ -1512,6 +1689,58 @@ function classifierLoadCSV(input) {
   formData.append('file', file);
   xhr.open('POST', '/api/classifier/upload-csv');
   xhr.send(formData);
+}
+
+// Show the whole-CSV classification breakdown (every row) in the result box.
+function renderCsvClassification(st) {
+  const total   = st.total_rows   || 0;
+  const benign  = st.benign_count || 0;
+  const attacks = st.attack_count || 0;
+  const hasAttacks = attacks > 0;
+
+  const idle    = document.getElementById('clf2-result-idle');
+  const content = document.getElementById('clf2-result-content');
+  if (idle) idle.style.display = 'none';
+
+  const labelEl = document.getElementById('clf2-pred-label');
+  const classEl = document.getElementById('clf2-pred-class');
+  if (labelEl) {
+    labelEl.textContent = hasAttacks ? 'THREATS DETECTED' : 'ALL BENIGN';
+    labelEl.className = 'clf2-pred-label ' + (hasAttacks ? 'clf2-label-threat' : 'clf2-label-benign');
+  }
+  if (classEl) classEl.textContent =
+    total + ' rows classified • ' + attacks + ' attacks, ' + benign + ' benign';
+
+  // Distribution = benign + each attack class, as % of all rows
+  const dist = [];
+  if (benign) dist.push({ class: 'Benign', count: benign });
+  Object.entries(st.attack_distribution || {}).forEach(([c, n]) => dist.push({ class: c, count: n }));
+  dist.sort((a, b) => b.count - a.count);
+
+  const probSec = document.getElementById('clf2-prob-section');
+  const ptitle  = document.getElementById('clf2-prob-title');
+  const barsDiv = document.getElementById('prob-bars');
+  if (ptitle) ptitle.textContent = 'CSV Classification (' + total + ' rows)';
+  if (probSec) probSec.style.display = dist.length ? 'block' : 'none';
+  if (barsDiv) {
+    barsDiv.innerHTML = '';
+    dist.slice(0, 12).forEach(d => {
+      const pct = total ? (d.count / total * 100) : 0;
+      const isBenign = String(d.class).toLowerCase() === 'benign';
+      const row = document.createElement('div');
+      row.className = 'prob-row';
+      row.innerHTML =
+        '<span class="prob-label">' + escHtml(d.class) + ' (' + d.count + ')</span>' +
+        '<div class="prob-track"><div class="prob-fill ' + (isBenign ? 'fill-benign' : 'fill-threat') +
+          '" style="width:' + Math.max(pct, 0.5) + '%"></div></div>' +
+        '<span class="prob-val">' + pct.toFixed(1) + '%</span>';
+      barsDiv.appendChild(row);
+    });
+  }
+
+  const flowsSec = document.getElementById('clf2-flows-section');
+  if (flowsSec) flowsSec.style.display = 'none';
+  if (content) content.style.display = 'flex';
 }
 
 // Bulk-classify a CSV and save a Gemini-authored Word (.docx) security report.
@@ -1561,13 +1790,15 @@ function generateReportFromFile(file) {
     progStat.textContent = 'Waiting for save location…';
     progXfer.textContent = fmtBytes(file.size) + ' uploaded';
     progLeft.textContent = '';
-    progRows.textContent = '📁 A "Save As" dialog should appear — pick a location, then it generates (10–60s).';
+    progRows.textContent = 'A "Save As" dialog should appear — pick a location, then it generates (10–60s).';
   });
 
   xhr.addEventListener('load', () => {
     let data;
     try { data = JSON.parse(xhr.responseText); } catch { data = { success: false, error: 'Invalid server response' }; }
 
+    const resBox = document.getElementById('clf2-result-box');
+    if (resBox) resBox.className = 'clf2-result-box';
     if (data.success) {
       const st = data.stats || {};
       const total = st.total_rows != null ? st.total_rows : '?';
@@ -1579,6 +1810,7 @@ function generateReportFromFile(file) {
       progRows.textContent = total + ' rows • ' + atk + ' attacks' + trunc;
       progLeft.textContent = '';
       progFile.textContent = data.filename || file.name;
+      renderCsvClassification(st);   // show the whole-CSV breakdown in the result box
       toast('success', 'Word Report', 'Saved to ' + (data.saved_path || data.filename));
       setTimeout(() => { progWrap.style.display = 'none'; }, 6000);
       done();
@@ -1586,6 +1818,10 @@ function generateReportFromFile(file) {
       progBar.classList.remove('prog-analyzing');
       progStat.textContent = 'Save cancelled';
       progRows.textContent = ''; progLeft.textContent = '';
+      const idle = document.getElementById('clf2-result-idle');
+      const content = document.getElementById('clf2-result-content');
+      if (content) content.style.display = 'none';
+      if (idle) { idle.style.display = 'flex'; const t = idle.querySelector('.clf2-idle-text'); if (t) t.textContent = 'Save cancelled'; }
       toast('info', 'Word Report', 'Save cancelled — no report was created.');
       setTimeout(() => { progWrap.style.display = 'none'; }, 3500);
       done();
@@ -1593,6 +1829,10 @@ function generateReportFromFile(file) {
       progBar.classList.remove('prog-analyzing');
       progBar.classList.add('prog-error');
       progStat.textContent = 'Error'; progRows.textContent = ''; progLeft.textContent = '';
+      const idle = document.getElementById('clf2-result-idle');
+      const content = document.getElementById('clf2-result-content');
+      if (content) content.style.display = 'none';
+      if (idle) { idle.style.display = 'flex'; const t = idle.querySelector('.clf2-idle-text'); if (t) t.textContent = 'Error: ' + (data.error || 'failed'); }
       toast('error', 'Word Report', data.error || 'Report generation failed');
       done();
     }
@@ -1613,20 +1853,20 @@ function generateReportFromFile(file) {
 // Save the current traffic as a .pcap file. The local server pops a native Save
 // dialog and writes the file with scapy — works in any browser.
 function saveCapture() {
-  if (!state.packets.length) { toast('info', '💾 Save', 'No packets to save yet.'); return; }
-  toast('info', '💾 Save Capture', 'Choose where to save the .pcap when prompted…');
+  if (!state.packets.length) { toast('info', 'Save', 'No packets to save yet.'); return; }
+  toast('info', 'Save Capture', 'Choose where to save the .pcap when prompted…');
   fetch('/api/capture/save-pcap', { method: 'POST' })
     .then(r => r.json())
     .then(data => {
       if (data.success) {
-        toast('success', '💾 Saved', data.count + ' packets → ' + (data.saved_path || data.filename));
+        toast('success', 'Saved', data.count + ' packets → ' + (data.saved_path || data.filename));
       } else if (data.cancelled) {
-        toast('info', '💾 Save', 'Save cancelled.');
+        toast('info', 'Save', 'Save cancelled.');
       } else {
-        toast('error', '💾 Save', data.error || 'Could not save capture');
+        toast('error', 'Save', data.error || 'Could not save capture');
       }
     })
-    .catch(() => toast('error', '💾 Save', 'Request failed'));
+    .catch(() => toast('error', 'Save', 'Request failed'));
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
@@ -1749,14 +1989,14 @@ function uploadRulesFile(input) {
   input.value = '';
 
   if (!file.name.toLowerCase().endsWith('.rules')) {
-    toast('high', '❌ Invalid File', 'Please select a file ending in .rules');
+    toast('high', 'Invalid File', 'Please select a file ending in .rules');
     return;
   }
 
   const formData = new FormData();
   formData.append('file', file);
 
-  toast('info', '📤 Uploading Rules', `Uploading ${file.name}...`);
+  toast('info', 'Uploading Rules', `Uploading ${file.name}...`);
 
   fetch('/api/rules/upload', {
     method: 'POST',
@@ -1765,17 +2005,17 @@ function uploadRulesFile(input) {
     .then(r => r.json())
     .then(data => {
       if (data.success) {
-        toast('info', '📜 Rules Imported', `Successfully loaded ${data.rules_count} rules from ${data.filename}`);
+        toast('info', 'Rules Imported', `Successfully loaded ${data.rules_count} rules from ${data.filename}`);
       } else {
-        toast('high', '❌ Import Failed', data.error);
+        toast('high', 'Import Failed', data.error);
       }
     })
     .catch(e => {
-      toast('high', '❌ Import Error', 'Failed to upload rules file');
+      toast('high', 'Import Error', 'Failed to upload rules file');
     });
 }
 
 function setCaptureMode(live) {
   socket.emit('toggle_capture_mode', { live: live });
-  toast('info', '⚙ Mode Changed', `Switched to ${live ? 'Live Sniffer' : 'Simulation Mode'}`);
+  toast('info', 'Mode Changed', `Switched to ${live ? 'Live Sniffer' : 'Simulation Mode'}`);
 }
