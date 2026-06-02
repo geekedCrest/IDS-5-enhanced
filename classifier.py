@@ -1,22 +1,53 @@
+# -*- coding: utf-8 -*-
+"""
+Web ML Classifier backend for the IDS dashboard.
+
+Faithfully reproduces the prediction pipelines of the two desktop apps
+(cicids_app_complete.py and cicids_desktop_app.py) so they can be driven from a
+browser tab instead of a Tkinter window. The model logic, feature handling and
+Gemini reporting are kept identical to the originals — only the GUI layer is web.
+
+Two models are supported:
+  * "cyber"  — cicids_app_complete.py: separate model + StandardScaler + encoder;
+               inputs are SCALED before prediction. feature names live on
+               model.feature_columns.
+  * "cicids" — cicids_desktop_app.py: a single bundle dict
+               {model, label_encoder, feature_means, feature_columns}; NO scaler
+               (raw features), defaults come from feature_means.
+"""
+
 import os
 import re
+import gc
+import time
 import warnings
 from io import BytesIO
+from datetime import datetime
+
 import joblib
 import numpy as np
 import pandas as pd
 
-warnings.filterwarnings('ignore', category=UserWarning)
+# The pickled models were trained on an older scikit-learn; silence the
+# version-mismatch and feature-name warnings (predictions are unaffected).
+warnings.filterwarnings('ignore')
 
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH  = os.path.join(BASE_DIR, 'uploaded', 'cyber_rf_model.joblib')
-SCALER_PATH = os.path.join(BASE_DIR, 'uploaded', 'cyber_scaler.joblib')
-ENCODER_PATH = os.path.join(BASE_DIR, 'uploaded', 'cyber_encoder.joblib')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, 'uploaded')
 
-# ── Word-report generation (Gemini AI) ──────────────────────────────────────────
-# Max CSV rows classified for a single report request (keeps the web request
-# responsive; the report notes when the file was larger and was truncated).
-REPORT_MAX_ROWS = int(os.environ.get('REPORT_MAX_ROWS', '100000'))
+# Gemini key resolution: GEMINI_API_KEY env var → gemini_api_key.txt (gitignored).
+# The key is NEVER hardcoded here so it is not committed to source control.
+def get_gemini_api_key():
+    key = os.environ.get('GEMINI_API_KEY', '').strip()
+    if key:
+        return key
+    key_file = os.path.join(BASE_DIR, 'gemini_api_key.txt')
+    if os.path.exists(key_file):
+        with open(key_file, 'r', encoding='utf-8') as fh:
+            fk = fh.read().strip()
+            if fk:
+                return fk
+    return ''
 
 GEMINI_SYSTEM_PROMPT = (
     "You are an expert Senior Cyber Security Analyst & Digital Forensics Examiner. "
@@ -30,339 +61,182 @@ GEMINI_SYSTEM_PROMPT = (
     "flow_duration), 3. Risk Assessment (severity and impact on infrastructure like Web, FTP, "
     "or SSH servers), 4. Mitigation & Remediation Strategies (clear, actionable engineering "
     "solutions for each attack, e.g., Rate Limiting, Timeout adjustments, Fail2ban, and CDNs). "
-    "Maintain a formal, academic, and rigorous tone, avoiding generic descriptions. "
-    "Format the report using Markdown headings (#, ##, ###) and bullet lists."
+    "Maintain a formal, academic, and rigorous tone, avoiding generic descriptions."
 )
 
-
-def get_gemini_api_key():
-    """Resolve the Gemini API key: env var first, then a local gitignored file."""
-    key = os.environ.get('GEMINI_API_KEY', '').strip()
-    if key:
-        return key
-    key_file = os.path.join(BASE_DIR, 'gemini_api_key.txt')
-    if os.path.exists(key_file):
-        with open(key_file, 'r', encoding='utf-8') as fh:
-            return fh.read().strip()
-    return ''
-
-KEY_FEATURES = [
-    # ── Flow identity ──────────────────────────────────────────────────────
-    ('dst_port',           'Destination Port',          '80=HTTP  443=HTTPS  22=SSH  21=FTP  53=DNS  3389=RDP'),
-    ('protocol',           'Protocol',                  '6 = TCP     17 = UDP     1 = ICMP     0 = Other'),
-    ('flow_duration',      'Flow Duration (µs)',        'Total session length in microseconds'),
-    # ── Packet counts ──────────────────────────────────────────────────────
-    ('tot_fwd_pkts',       'Total Fwd Packets',         'Packets sent from source → destination'),
-    ('tot_bwd_pkts',       'Total Bwd Packets',         'Packets sent from destination → source'),
-    ('tot_len_fwd_pkts',   'Total Fwd Payload (bytes)', 'Total byte volume in the forward direction'),
-    ('tot_len_bwd_pkts',   'Total Bwd Payload (bytes)', 'Total byte volume in the backward direction'),
-    # ── Flow rates ─────────────────────────────────────────────────────────
-    ('flow_byts_s',        'Flow Bytes / s',            'Total bytes transferred per second'),
-    ('flow_pkts_s',        'Flow Packets / s',          'Total packets per second (both directions)'),
-    ('fwd_pkts_s',         'Fwd Packets / s',           'Forward-direction packet rate'),
-    ('bwd_pkts_s',         'Bwd Packets / s',           'Backward-direction packet rate'),
-    # ── Packet sizes ───────────────────────────────────────────────────────
-    ('fwd_pkt_len_max',    'Fwd Pkt Length Max',        'Largest forward-direction packet (bytes)'),
-    ('pkt_len_mean',       'Mean Packet Length',        'Average size of all packets in the flow'),
-    ('pkt_len_std',        'Packet Length Std Dev',     'Variance in packet sizes — high = mixed traffic'),
-    # ── Timing ─────────────────────────────────────────────────────────────
-    ('flow_iat_mean',      'Flow IAT Mean (µs)',        'Average inter-arrival time between packets'),
-    ('init_fwd_win_byts',  'Init Fwd Window (bytes)',   'Initial TCP receive window size (forward)'),
-    # ── TCP Flags ──────────────────────────────────────────────────────────
-    ('syn_flag_cnt',       'SYN Flag Count',            'SYN flags seen — high value signals SYN flood'),
-    ('ack_flag_cnt',       'ACK Flag Count',            'ACK flags — normally matches packet count'),
-    ('fin_flag_cnt',       'FIN Flag Count',            'FIN flags — graceful connection teardown'),
-    ('rst_flag_cnt',       'RST Flag Count',            'RST flags — forced resets, scanning indicator'),
-    ('psh_flag_cnt',       'PSH Flag Count',            'PSH flags — data push events in the flow'),
-    # ── Ratios ─────────────────────────────────────────────────────────────
-    ('down_up_ratio',      'Down / Up Ratio',           'Bytes received ÷ bytes sent; >1 = download heavy'),
+# ── Per-model registry ────────────────────────────────────────────────────────
+CYBER_KEY_FEATURES = [
+    ('init_fwd_win_byts', 'Init Fwd Win Bytes', 'Number of bytes sent in the initial window in the forward direction. High values can suggest TCP handshake anomalies or scanning behavior.'),
+    ('dst_port', 'Destination Port', 'The destination port of the traffic. Scanning actions often target multiple ports, while specific services like HTTP (80/443) or SSH (22) have known ports.'),
+    ('init_bwd_win_byts', 'Init Bwd Win Bytes', 'Number of bytes sent in the initial window in the backward direction. Highly indicative of server responses during connection establishment.'),
+    ('fwd_seg_size_min', 'Min Fwd Segment Size', 'Minimum segment size observed in the forward direction. Often reflects TCP header options set by attackers.'),
+    ('flow_iat_mean', 'Flow IAT Mean', 'Mean time between two flows. Short intervals are common in automated scripts or high-rate Denial-of-Service attacks.'),
+    ('flow_iat_max', 'Flow IAT Max', 'Maximum time between two flows. Useful for identifying periodic beaconing or slow-rate exfiltration.'),
+    ('flow_duration', 'Flow Duration', 'Total duration of the network flow in microseconds. Extremely short or excessively long flows can indicate anomalous sessions.'),
+    ('fwd_header_len', 'Fwd Header Length', 'Total bytes used for headers in the forward direction. Discrepancies between header size and payload can point to packet craft attacks.'),
+    ('flow_pkts_s', 'Flow Packets/s', 'Total number of flow packets per second. Massive spikes indicate flood attacks (e.g., Syn Flood, DDoS).'),
+    ('fwd_pkt_len_max', 'Max Fwd Packet Length', 'Maximum size of a packet in the forward direction. Large unexpected packets can be a sign of buffer overflow attempts or exfiltration.'),
+    ('protocol', 'Protocol', 'The network protocol used (e.g., TCP=6, UDP=17). Certain attacks are protocol-specific.'),
+    ('tot_fwd_pkts', 'Total Forward Packets', 'Total packets sent in the forward direction. High count indicates high-intensity connection attempts.'),
+    ('tot_bwd_pkts', 'Total Backward Packets', 'Total packets received in the backward direction. Helps check session symmetry and response ratios.'),
+    ('flow_byts_s', 'Flow Bytes/s', 'Total bytes transferred per second. Indicates bandwidth consumption, useful to distinguish volume attacks.'),
 ]
 
-_scaler    = None
-_encoder   = None
-_model     = None
-_feat_cols = None
+CICIDS_KEY_FEATURES = [
+    ('dst_port', 'Destination Port', 'Destination port: indicates the targeted service or host port, useful to detect scanning and targeted attacks.'),
+    ('flow_duration', 'Flow Duration', 'Flow duration: session length which can indicate long-running suspicious connections.'),
+    ('tot_fwd_pkts', 'Total Fwd Packets', 'Total forward packets: measures request intensity from the source towards the destination.'),
+    ('tot_bwd_pkts', 'Total Backward Packets', 'Total backward packets: measures responses from the destination to the source.'),
+    ('fwd_pkt_len_max', 'Fwd Packet Length Max', 'Forward packet max length: large unusual packets can be a sign of certain attacks.'),
+    ('flow_byts_s', 'Flow Bytes/s', 'Flow bytes/s: bytes per second indicating the volume and intensity of traffic.'),
+]
 
-
-def _load_meta():
-    global _scaler, _encoder, _feat_cols
-    if _scaler is not None:
-        return
-    _scaler    = joblib.load(SCALER_PATH)
-    _encoder   = joblib.load(ENCODER_PATH)
-    _feat_cols = list(_scaler.feature_names_in_)
-
-
-def _load_model():
-    global _model
-    if _model is not None:
-        return
-    _load_meta()
-    _model = joblib.load(MODEL_PATH, mmap_mode='r')
-
-
-def get_model():
-    _load_model()
-    return _model
-
-
-def get_model_metadata():
-    _load_meta()
-    return {
-        'classes': list(_encoder.classes_),
-        'n_features': len(_feat_cols),
-        'dataset': 'CICIDS 2017 / 2018',
-        'algorithm': 'Random Forest',
-        'estimators': 200,
-        'training_samples': 916666,
-    }
-
-
-def get_feature_info():
-    _load_meta()
-    means = dict(zip(_feat_cols, _scaler.mean_))
-    info = {}
-    for col, label, desc in KEY_FEATURES:
-        info[col] = {
-            'label': label,
-            'description': desc,
-            'type': 'numeric',
-            'median': round(float(means.get(col, 0.0)), 4),
-        }
-    return info
-
-
-def predict_single(row_dict):
-    _load_model()
-    means = dict(zip(_feat_cols, _scaler.mean_))
-    row = [means.get(col, 0.0) for col in _feat_cols]
-    col_idx = {col: i for i, col in enumerate(_feat_cols)}
-    for key, val in row_dict.items():
-        if key in col_idx and val not in (None, ''):
-            try:
-                row[col_idx[key]] = float(val)
-            except (ValueError, TypeError):
-                pass
-    X = np.array(row, dtype=float).reshape(1, -1)
-    X_scaled = _scaler.transform(X)
-    pred_enc = _model.predict(X_scaled)
-    pred_label = _encoder.inverse_transform(pred_enc)[0]
-    result = {'prediction': str(pred_label)}
-    if hasattr(_model, 'predict_proba'):
-        probs = _model.predict_proba(X_scaled)[0]
-        classes = list(_encoder.classes_)
-        class_probs = sorted(zip(classes, probs), key=lambda x: x[1], reverse=True)
-        result['probabilities'] = [
-            {'class': c, 'prob': round(float(p) * 100, 2)}
-            for c, p in class_probs[:5]
-        ]
-    return result
-
-
-def predict_batch(rows, defaults=None):
-    """Classify many feature dicts at once. `rows` is a list of {feature_name: value}.
-    Returns a list of {'prediction': str, 'confidence': float} aligned with `rows`.
-
-    `defaults` (optional) is a {feature_name: value} dict — e.g. medians from an
-    uploaded CSV — used as the BASELINE for features not present in a row. Any
-    feature not covered by `defaults` falls back to the scaler's training mean.
-    """
-    _load_model()
-    if not rows:
-        return []
-    col_idx = {col: i for i, col in enumerate(_feat_cols)}
-
-    base = [float(_scaler.mean_[i]) for i in range(len(_feat_cols))]
-    if defaults:
-        for key, val in defaults.items():
-            i = col_idx.get(key)
-            if i is not None and val not in (None, ''):
-                try:
-                    base[i] = float(val)
-                except (ValueError, TypeError):
-                    pass
-
-    X = np.tile(np.array(base, dtype=float), (len(rows), 1))
-    for r, row_dict in enumerate(rows):
-        for key, val in row_dict.items():
-            i = col_idx.get(key)
-            if i is not None and val not in (None, ''):
-                try:
-                    X[r, i] = float(val)
-                except (ValueError, TypeError):
-                    pass
-
-    X_scaled = _scaler.transform(X)
-    pred_enc = _model.predict(X_scaled)
-    labels = _encoder.inverse_transform(pred_enc)
-    results = []
-    if hasattr(_model, 'predict_proba'):
-        probs = _model.predict_proba(X_scaled)
-        for i, lab in enumerate(labels):
-            results.append({'prediction': str(lab),
-                            'confidence': round(float(probs[i].max()) * 100, 2)})
-    else:
-        for lab in labels:
-            results.append({'prediction': str(lab), 'confidence': None})
-    return results
-
-
-def _norm_col(name):
-    """Normalise a CSV column name to internal snake_case (e.g. 'Dst Port' → 'dst_port')."""
-    import re
-    return re.sub(r'[\s/\-\.]+', '_', name.strip().lower()).strip('_')
-
-
-def dataset_report_from_csv(file_stream, filename=''):
-    """Compute a dataset-composition report from an uploaded CSV (reads the label
-    column fully to get the real per-class distribution). Mirrors the shape of the
-    static /api/dataset-report payload so the Statistics panel can render it."""
-    file_stream.seek(0)
-    header = pd.read_csv(file_stream, nrows=0)
-    cols = list(header.columns)
-
-    label_col = None
-    for c in cols:
-        if c.strip().lower() in ('label', 'predicted_label', 'class', 'attack', 'category'):
-            label_col = c
-            break
-
-    file_stream.seek(0)
-    if label_col is None:
-        # No labels — just report row/feature counts.
-        first = pd.read_csv(file_stream, usecols=[cols[0]], low_memory=False, on_bad_lines='skip')
-        total = int(len(first))
-        return {
-            'success': True, 'source': 'csv', 'has_labels': False,
-            'dataset': filename or 'Uploaded CSV', 'total_samples': total,
-            'n_features': len(cols), 'n_classes': 0,
-            'benign_count': 0, 'benign_pct': 0.0, 'attack_count': 0, 'attack_pct': 0.0,
-            'algorithm': 'Random Forest', 'estimators': 200, 'classes': [],
-        }
-
-    series = pd.read_csv(file_stream, usecols=[label_col], low_memory=False,
-                         on_bad_lines='skip')[label_col].astype(str).str.strip()
-    vc = series.value_counts()
-    total = int(vc.sum()) or 1
-
-    classes, benign_count = [], 0
-    for name, cnt in vc.items():
-        cnt = int(cnt)
-        is_benign = name.lower() in ('benign', 'normal', 'benign traffic')
-        if is_benign:
-            benign_count += cnt
-        classes.append({'name': name, 'count': cnt,
-                        'pct': round(cnt / total * 100, 4), 'is_benign': is_benign})
-    attack_count = total - benign_count
-
-    return {
-        'success': True, 'source': 'csv', 'has_labels': True,
-        'dataset': filename or 'Uploaded CSV', 'total_samples': total,
-        'n_features': max(0, len(cols) - 1), 'n_classes': len(classes),
-        'benign_count': benign_count, 'benign_pct': round(benign_count / total * 100, 2),
-        'attack_count': attack_count, 'attack_pct': round(attack_count / total * 100, 2),
-        'algorithm': 'Random Forest', 'estimators': 200, 'classes': classes,
-    }
-
-
-def feature_info_from_csv(file_stream, nrows=2000):
-    _load_meta()
-    df = pd.read_csv(file_stream, nrows=nrows, low_memory=False, on_bad_lines='skip')
-
-    # Drop label / metadata columns
-    drop_candidates = ('Label', ' Label', 'label', 'Predicted_Label',
-                       '__source_file', 'Timestamp', ' Timestamp',
-                       'Src IP', 'Dst IP', 'Src Port', ' Source Port')
-    df = df.drop(columns=[c for c in drop_candidates if c in df.columns])
-
-    # Build a normalised-name → original-name lookup so we can match
-    # internal names like 'dst_port' against CSV headers like 'Dst Port'
-    col_map = {_norm_col(c): c for c in df.columns}
-
-    # Some CSV variants use abbreviated names that don't normalise to the
-    # model's internal names — add explicit aliases here.
-    _ALIASES = {
-        'tot_len_fwd_pkts': ['totlen_fwd_pkts', 'total_length_of_fwd_packets',
-                             'total_fwd_packets_length', 'totlen_fwd_pkts'],
-        'tot_len_bwd_pkts': ['totlen_bwd_pkts', 'total_length_of_bwd_packets',
-                             'total_bwd_packets_length'],
-    }
-    for internal, candidates in _ALIASES.items():
-        if internal not in col_map:
-            for alias in candidates:
-                if alias in col_map:
-                    col_map[internal] = col_map[alias]
-                    break
-
-    means = dict(zip(_feat_cols, _scaler.mean_))
-    info = {}
-    for col, label, desc in KEY_FEATURES:
-        csv_col = col_map.get(col)          # e.g. col='dst_port' → csv_col='Dst Port'
-        if csv_col and pd.api.types.is_numeric_dtype(df[csv_col]):
-            series = df[csv_col].dropna()
-            med = float(series.median()) if not series.empty else means.get(col, 0.0)
-        else:
-            med = means.get(col, 0.0)
-        info[col] = {
-            'label': label,
-            'description': desc,
-            'type': 'numeric',
-            'median': round(med, 4),
-        }
-    return info
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# Word-report pipeline:  CSV → bulk classify → statistics → Gemini → DOCX
-# (Ports the behaviour of uploaded/cicids_app_complete.py into the web dashboard.)
-# ════════════════════════════════════════════════════════════════════════════════
-
-_ALIASES = {
-    'tot_len_fwd_pkts': ['totlen_fwd_pkts', 'total_length_of_fwd_packets',
-                         'total_fwd_packets_length'],
-    'tot_len_bwd_pkts': ['totlen_bwd_pkts', 'total_length_of_bwd_packets',
-                         'total_bwd_packets_length'],
+MODELS = {
+    'cyber': {
+        'label': 'Cyber RF (scaled)',
+        'kind': 'scaled',
+        'model_file': os.path.join(UPLOAD_DIR, 'cyber_rf_model.joblib'),
+        'scaler_file': os.path.join(UPLOAD_DIR, 'cyber_scaler.joblib'),
+        'encoder_file': os.path.join(UPLOAD_DIR, 'cyber_encoder.joblib'),
+        'key_features': CYBER_KEY_FEATURES,
+        'source': 'cicids_app_complete.py',
+    },
+    'cicids': {
+        'label': 'CICIDS RF (bundle)',
+        'kind': 'bundle',
+        'model_file': os.path.join(UPLOAD_DIR, 'cicids_rf_model.joblib'),
+        'key_features': CICIDS_KEY_FEATURES,
+        'source': 'cicids_desktop_app.py',
+    },
 }
 
 
-def _build_feature_matrix(df):
-    """Align an arbitrary CICIDS-style CSV to the model's feature columns.
-
-    Returns a DataFrame with exactly `_feat_cols` columns (in order). Missing or
-    non-numeric columns are filled with the scaler's training mean for that feature.
-    Also returns the list of feature names that were actually matched from the CSV.
-    """
-    col_map = {_norm_col(c): c for c in df.columns}
-    for internal, candidates in _ALIASES.items():
-        if internal not in col_map:
-            for alias in candidates:
-                if alias in col_map:
-                    col_map[internal] = col_map[alias]
-                    break
-
-    means = dict(zip(_feat_cols, _scaler.mean_))
-    data = {}
-    matched = []
-    n = len(df)
-    for col in _feat_cols:
-        csv_col = col_map.get(col)
-        if csv_col is not None:
-            series = pd.to_numeric(df[csv_col], errors='coerce')
-            series = series.replace([np.inf, -np.inf], np.nan)
-            if series.notna().any():
-                data[col] = series.fillna(means.get(col, 0.0)).to_numpy()
-                matched.append(col)
-                continue
-        data[col] = np.full(n, means.get(col, 0.0), dtype=float)
-
-    X = pd.DataFrame(data, columns=_feat_cols)
-    return X, matched
+def available_models():
+    """List models that are present on disk (for the dashboard selector)."""
+    out = []
+    for mid, cfg in MODELS.items():
+        ready = os.path.exists(cfg['model_file'])
+        out.append({'id': mid, 'label': cfg['label'], 'kind': cfg['kind'], 'ready': ready})
+    return out
 
 
-def analyze_csv_predictions(file_stream, max_rows=REPORT_MAX_ROWS):
-    """Read a CSV, classify every row, and return (predictions, X, matched, total, truncated)."""
-    _load_model()
-    # Read one extra row to detect truncation
+# ── Single-slot lazy cache (bounds RAM to one ~2.6 GB model at a time) ─────────
+_loaded = {'id': None, 'obj': None}
+
+
+def _load(model_id):
+    cfg = MODELS[model_id]
+    if not os.path.exists(cfg['model_file']):
+        raise FileNotFoundError(f"Model file missing: {cfg['model_file']}")
+
+    if cfg['kind'] == 'scaled':
+        model = joblib.load(cfg['model_file'])
+        scaler = joblib.load(cfg['scaler_file'])
+        encoder = joblib.load(cfg['encoder_file'])
+        feature_columns = list(model.feature_columns)
+        # baseline defaults = scaler training means, aligned to feature_columns
+        means = {f: float(scaler.mean_[i]) for i, f in enumerate(feature_columns)}
+        return {'kind': 'scaled', 'model': model, 'scaler': scaler, 'encoder': encoder,
+                'feature_columns': feature_columns, 'means': means,
+                'key_features': cfg['key_features']}
+
+    # bundle (no scaler, raw features)
+    b = joblib.load(cfg['model_file'])
+    model = b['model']
+    encoder = b['label_encoder']
+    feature_columns = list(b['feature_columns'])
+    feature_means = pd.Series(b['feature_means'])
+    means = {f: float(feature_means.get(f, 0.0)) for f in feature_columns}
+    return {'kind': 'bundle', 'model': model, 'scaler': None, 'encoder': encoder,
+            'feature_columns': feature_columns, 'means': means,
+            'feature_means': feature_means, 'key_features': cfg['key_features']}
+
+
+def _get(model_id):
+    if model_id not in MODELS:
+        raise ValueError(f'Unknown model: {model_id}')
+    if _loaded['id'] != model_id:
+        # Evict the previously loaded model first to keep memory bounded.
+        _loaded['obj'] = None
+        _loaded['id'] = None
+        gc.collect()
+        _loaded['obj'] = _load(model_id)
+        _loaded['id'] = model_id
+    return _loaded['obj']
+
+
+def get_model_info(model_id):
+    """Load (if needed) and return feature form + class list for the dashboard."""
+    m = _get(model_id)
+    feats = []
+    for name, label, desc in m['key_features']:
+        feats.append({'name': name, 'label': label, 'desc': desc,
+                      'default': round(m['means'].get(name, 0.0), 4)})
+    return {
+        'id': model_id,
+        'label': MODELS[model_id]['label'],
+        'kind': m['kind'],
+        'features': feats,
+        'n_features': len(m['feature_columns']),
+        'classes': list(map(str, m['encoder'].classes_)),
+        'n_classes': len(m['encoder'].classes_),
+        'algorithm': 'Random Forest',
+    }
+
+
+def _is_benign(label):
+    return str(label).strip().lower() in ('benign', 'normal', 'benign traffic')
+
+
+def predict_single(model_id, input_dict):
+    """Classify one flow from the manual feature form (faithful per-model pipeline)."""
+    m = _get(model_id)
+    fc = m['feature_columns']
+
+    # Baseline = per-feature means; override with any user-supplied key features.
+    values = dict(m['means'])
+    for k, v in (input_dict or {}).items():
+        if k in values and v not in (None, ''):
+            try:
+                values[k] = float(v)
+            except (ValueError, TypeError):
+                pass
+
+    vec = np.array([values.get(f, 0.0) for f in fc], dtype=float).reshape(1, -1)
+    X = m['scaler'].transform(vec) if m['kind'] == 'scaled' else vec
+
+    pred_enc = m['model'].predict(X)
+    label = str(m['encoder'].inverse_transform(pred_enc)[0])
+    result = {'prediction': label, 'is_attack': not _is_benign(label)}
+
+    if hasattr(m['model'], 'predict_proba'):
+        probs = m['model'].predict_proba(X)[0]
+        classes = list(map(str, m['encoder'].classes_))
+        top = sorted(zip(classes, probs), key=lambda x: x[1], reverse=True)[:6]
+        result['confidence'] = round(float(np.max(probs)) * 100, 2)
+        result['probabilities'] = [{'class': c, 'prob': round(float(p) * 100, 2)} for c, p in top]
+    return result
+
+
+def _align_dataframe(m, df):
+    """Reindex an arbitrary CSV to the model's feature_columns, filling gaps with means."""
+    fc = m['feature_columns']
+    df = df.copy()
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    for f in fc:
+        if f not in df.columns:
+            df[f] = m['means'].get(f, 0.0)
+        else:
+            df[f] = pd.to_numeric(df[f], errors='coerce')
+    df = df[fc]
+    # Fill remaining NaNs with the per-feature baseline mean.
+    df = df.fillna(value={f: m['means'].get(f, 0.0) for f in fc})
+    return df
+
+
+def predict_csv(model_id, file_stream, max_rows=1_000_000):
+    """Bulk-classify an uploaded CSV. Returns a distribution summary + sample rows."""
+    m = _get(model_id)
     df = pd.read_csv(file_stream, nrows=max_rows + 1, low_memory=False, on_bad_lines='skip')
     truncated = len(df) > max_rows
     if truncated:
@@ -370,159 +244,239 @@ def analyze_csv_predictions(file_stream, max_rows=REPORT_MAX_ROWS):
     if df.empty:
         raise ValueError('The uploaded CSV contains no data rows.')
 
-    # Drop obvious label / metadata columns so they don't pollute feature matching
-    drop_candidates = ('Label', ' Label', 'label', 'Predicted_Label',
-                       '__source_file', 'Timestamp', ' Timestamp',
-                       'Src IP', 'Dst IP', 'Flow ID')
-    df = df.drop(columns=[c for c in drop_candidates if c in df.columns])
+    X = _align_dataframe(m, df)
+    Xt = m['scaler'].transform(X) if m['kind'] == 'scaled' else X.values
+    preds = m['encoder'].inverse_transform(m['model'].predict(Xt))
 
-    X, matched = _build_feature_matrix(df)
-    if not matched:
-        raise ValueError('No recognisable CICIDS feature columns were found in this CSV.')
+    total = len(preds)
+    counts = {}
+    for p in preds:
+        counts[str(p)] = counts.get(str(p), 0) + 1
+    benign = sum(c for k, c in counts.items() if _is_benign(k))
+    attacks = total - benign
+    distribution = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
 
-    X_scaled = _scaler.transform(X)
-    pred_enc = _model.predict(X_scaled)
-    preds = _encoder.inverse_transform(pred_enc)
-    return preds, X, matched, len(df), truncated
+    sample = [{'row': i + 1, 'prediction': str(p), 'is_attack': not _is_benign(p)}
+              for i, p in enumerate(preds[:100])]
+
+    return {
+        'total_rows': total,
+        'benign_count': benign,
+        'attack_count': attacks,
+        'truncated': truncated,
+        'distribution': [{'class': c, 'count': n, 'pct': round(n / total * 100, 2)}
+                         for c, n in distribution],
+        'sample': sample,
+    }
 
 
-def _is_benign(label):
-    return str(label).strip().lower() in ('benign', 'normal', 'benign traffic')
+# ── Real-time chunked bulk analysis (ports the desktop Bulk Analysis dashboard) ─
+def count_rows(path):
+    """Fast row count (minus header) for an accurate progress bar."""
+    with open(path, 'rb') as f:
+        n = sum(buf.count(b'\n') for buf in iter(lambda: f.read(1024 * 1024), b''))
+    return max(n - 1, 0)
 
 
-def build_statistics_text(preds, X, matched, total_rows, truncated):
-    """Build the plain-text statistical report fed to Gemini (ports generate_statistics)."""
-    preds = np.asarray(preds)
-    unique_classes, counts = np.unique(preds, return_counts=True)
-    class_counts = dict(zip(unique_classes.tolist(), counts.tolist()))
+def _threat_buckets(class_counts):
+    """Bucket predicted classes into LOW/MEDIUM/HIGH/CRITICAL (desktop-app rules)."""
+    low = sum(c for k, c in class_counts.items() if _is_benign(k))
+    med = high = crit = 0
+    for name, c in class_counts.items():
+        if _is_benign(name):
+            continue
+        n = name.lower()
+        if 'ddos' in n or 'critical' in n or 'bot' in n:
+            crit += c
+        elif 'dos' in n or 'slowloris' in n or 'goldeneye' in n:
+            high += c
+        else:
+            med += c
+    return {'LOW': low, 'MEDIUM': med, 'HIGH': high, 'CRITICAL': crit}
 
-    benign_count = sum(c for k, c in class_counts.items() if _is_benign(k))
-    attack_count = total_rows - benign_count
 
-    benign_idx = [i for i, p in enumerate(preds) if _is_benign(p)]
-    attack_idx = [i for i, p in enumerate(preds) if not _is_benign(p)]
+def _system_threat(total, benign):
+    """Overall threat level from the attack ratio (desktop-app thresholds)."""
+    ratio = (total - benign) / total if total else 0.0
+    if ratio == 0:
+        return 'LOW'
+    if ratio <= 0.05:
+        return 'MEDIUM'
+    if ratio <= 0.20:
+        return 'HIGH'
+    return 'CRITICAL'
 
-    importances = pd.Series(_model.feature_importances_, index=_feat_cols)
-    top_features = importances.nlargest(5)
 
+def analyze_csv_chunks(model_id, path, total_rows, chunksize=20000):
+    """Generator: classify the CSV in chunks, yielding cumulative dashboard stats
+    after each chunk so the UI can update in real time. Bounds memory to one chunk."""
+    m = _get(model_id)
+    fc = m['feature_columns']
+    imp = pd.Series(m['model'].feature_importances_, index=fc).nlargest(1)
+    top_name, top_imp = imp.index[0], float(imp.values[0])
+
+    class_counts, proto = {}, {'TCP': 0, 'UDP': 0, 'Other': 0}
+    processed, sum_dur, sum_byts = 0, 0.0, 0.0
+
+    for chunk in pd.read_csv(path, chunksize=chunksize, low_memory=False, on_bad_lines='skip'):
+        X = _align_dataframe(m, chunk)
+        Xt = m['scaler'].transform(X) if m['kind'] == 'scaled' else X.values
+        preds = m['encoder'].inverse_transform(m['model'].predict(Xt))
+        for p in preds:
+            class_counts[str(p)] = class_counts.get(str(p), 0) + 1
+        for v in X['protocol'].values:
+            if v in (6, 6.0):
+                proto['TCP'] += 1
+            elif v in (17, 17.0):
+                proto['UDP'] += 1
+            else:
+                proto['Other'] += 1
+        if 'flow_duration' in X:
+            sum_dur += float(X['flow_duration'].sum())
+        if 'flow_byts_s' in X:
+            sum_byts += float(X['flow_byts_s'].sum())
+        processed += len(preds)
+
+        benign = sum(c for k, c in class_counts.items() if _is_benign(k))
+        denom = total_rows or processed
+        yield {
+            'processed': processed,
+            'total': denom,
+            'pct': round(min(processed / denom * 100, 100), 1),
+            'total_rows': processed,
+            'benign': benign,
+            'attacks': processed - benign,
+            'benign_pct': round(benign / processed * 100, 1),
+            'attack_pct': round((processed - benign) / processed * 100, 1),
+            'system_threat': _system_threat(processed, benign),
+            'threat_dist': _threat_buckets(class_counts),
+            'proto_dist': dict(proto),
+            'top_feature': top_name,
+            'top_feature_imp': round(top_imp * 100, 2),
+            'mean_flow_dur': round(sum_dur / processed, 2),
+            'mean_bandwidth': round(sum_byts / processed, 2),
+            'distribution': sorted(class_counts.items(), key=lambda kv: kv[1], reverse=True),
+        }
+
+
+def build_report_text(model_id, final):
+    """Build the Gemini statistics text from the accumulated bulk-analysis stats."""
+    m = _get(model_id)
+    top5 = pd.Series(m['model'].feature_importances_, index=m['feature_columns']).nlargest(5)
+    total, benign, attacks = final['total_rows'], final['benign'], final['attacks']
     lines = [
-        '=' * 60,
-        'NETWORK TRAFFIC ANALYSIS REPORT',
-        'Random Forest Classification Results (CICIDS 2017/2018)',
-        '=' * 60,
-        '',
-        f'Total Rows Analyzed: {total_rows}',
-        f'Benign Traffic: {benign_count} ({benign_count / total_rows * 100:.1f}%)',
-        f'Attack Traffic: {attack_count} ({attack_count / total_rows * 100:.1f}%)',
-        f'Feature Columns Matched From CSV: {len(matched)} / {len(_feat_cols)}',
-    ]
-    if truncated:
-        lines.append(f'NOTE: File was larger than the {total_rows}-row limit; only the '
-                     f'first {total_rows} rows were classified for this report.')
-    lines += [
-        '',
-        'Benign Row Indexes (1-based, first 50):',
-        f'{", ".join(str(i + 1) for i in benign_idx[:50])}{"..." if len(benign_idx) > 50 else ""}',
-        '',
-        'Attack Row Indexes (1-based, first 50):',
-        f'{", ".join(str(i + 1) for i in attack_idx[:50])}{"..." if len(attack_idx) > 50 else ""}',
-        '',
+        '=' * 60, 'NETWORK TRAFFIC ANALYSIS REPORT',
+        f"Model: {MODELS[model_id]['label']} (Random Forest)", '=' * 60, '',
+        f'Total Rows Analyzed: {total}',
+        f'Benign Traffic: {benign} ({final["benign_pct"]}%)',
+        f'Attack Traffic: {attacks} ({final["attack_pct"]}%)',
+        f'System Threat Level: {final["system_threat"]}', '',
         'Attack Type Distribution:',
     ]
-    attack_items = sorted(((k, c) for k, c in class_counts.items() if not _is_benign(k)),
-                          key=lambda kv: kv[1], reverse=True)
-    if attack_items:
-        for attack_type, count in attack_items:
-            lines.append(f'  {attack_type}: {count} rows ({count / total_rows * 100:.1f}%)')
-    else:
-        lines.append('  No attacks detected.')
+    for k, c in final['distribution']:
+        if not _is_benign(k):
+            lines.append(f'  {k}: {c} rows ({c / total * 100:.1f}%)')
+    lines += ['', 'Top 5 Most Important Features (model importance):']
+    for f, v in top5.items():
+        lines.append(f'  {f}: {v:.4f}')
+    lines += ['', 'Statistical Summary:',
+              f'  Mean flow duration: {final["mean_flow_dur"]:.2f} us',
+              f'  Mean bandwidth: {final["mean_bandwidth"]:.2f} B/s']
+    return '\n'.join(lines)
 
-    lines += ['', 'Top 5 Most Important Features (global model importance):']
-    for feat, importance in top_features.items():
-        lines.append(f'  {feat}: {importance:.4f}')
 
-    def _mean(col):
-        return float(X[col].mean()) if col in X.columns else 0.0
+# ── Gemini Word-report pipeline (ports cicids_app_complete.py behaviour) ───────
+def _build_statistics_text(model_id, df, preds):
+    m = _get(model_id)
+    preds = np.asarray([str(p) for p in preds])
+    classes, counts = np.unique(preds, return_counts=True)
+    class_counts = dict(zip(classes.tolist(), counts.tolist()))
+    total = len(preds)
+    benign = sum(c for k, c in class_counts.items() if _is_benign(k))
+    attacks = total - benign
 
-    lines += [
-        '',
-        'Statistical Summary (means over analyzed rows):',
-        f'  Mean flow duration: {_mean("flow_duration"):.2f}',
-        f'  Mean forward packets: {_mean("tot_fwd_pkts"):.2f}',
-        f'  Mean backward packets: {_mean("tot_bwd_pkts"):.2f}',
-        f'  Mean bytes/sec: {_mean("flow_byts_s"):.2f}',
-        '',
+    importances = pd.Series(m['model'].feature_importances_, index=m['feature_columns'])
+    top = importances.nlargest(5)
+
+    lines = [
+        '=' * 60, 'NETWORK TRAFFIC ANALYSIS REPORT',
+        f"Model: {MODELS[model_id]['label']} (Random Forest)", '=' * 60, '',
+        f'Total Rows Analyzed: {total}',
+        f'Benign Traffic: {benign} ({benign / total * 100:.1f}%)',
+        f'Attack Traffic: {attacks} ({attacks / total * 100:.1f}%)', '',
+        'Attack Type Distribution:',
     ]
-
-    stats = {
-        'total_rows': total_rows,
-        'benign_count': benign_count,
-        'attack_count': attack_count,
-        'attack_distribution': dict(attack_items),
-        'matched_features': len(matched),
-        'truncated': truncated,
-    }
-    return '\n'.join(lines), stats
+    for k, c in sorted(class_counts.items(), key=lambda kv: kv[1], reverse=True):
+        if not _is_benign(k):
+            lines.append(f'  {k}: {c} rows ({c / total * 100:.1f}%)')
+    lines += ['', 'Top 5 Most Important Features (model importance):']
+    for f, imp in top.items():
+        lines.append(f'  {f}: {imp:.4f}')
+    return '\n'.join(lines)
 
 
 def call_gemini_api(statistical_report):
-    """Send the statistical report to Gemini and return the Markdown security analysis."""
-    api_key = get_gemini_api_key()
-    if not api_key:
-        raise RuntimeError('No Gemini API key configured. Set GEMINI_API_KEY or create '
-                           'gemini_api_key.txt in the project root.')
+    """Send the statistics to Gemini and return Markdown (ports app behaviour)."""
     try:
         from google import genai
         from google.genai import types
     except ImportError:
         raise RuntimeError('google-genai not installed. Run: pip install google-genai')
 
-    client = genai.Client(api_key=api_key)
-    prompt = (
-        f"{GEMINI_SYSTEM_PROMPT}\n\n"
-        "====================================\n"
-        "Network traffic analysis statistics:\n"
-        "====================================\n\n"
-        f"{statistical_report}\n\n"
-        "====================================\n"
-        "Now, write the comprehensive security report:\n"
-        "===================================="
-    )
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=GEMINI_SYSTEM_PROMPT,
-            temperature=0.2,
-        ),
-    )
-    if not response.text:
-        raise RuntimeError('Gemini returned an empty response.')
-    return response.text
+    client = genai.Client(api_key=get_gemini_api_key())
 
+    # Inject the current system date so the generated report is always dated
+    # correctly instead of the model guessing. (C# equivalent: DateTime.Now.ToString("yyyy-MM-dd"))
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    dated_system_prompt = (f"{GEMINI_SYSTEM_PROMPT}\n\n"
+                           f"Report Date: {current_date}. Use this exact date as the report "
+                           f"date in the Executive Summary and document header; do not infer "
+                           f"or invent any other date.")
 
-def _add_inline_md(paragraph, text):
-    """Add `text` to a docx paragraph, rendering **bold** / *italic* markdown inline."""
-    # Split on **bold** and *italic* while keeping the delimiters
-    for part in re.split(r'(\*\*[^*]+\*\*|\*[^*]+\*)', text):
-        if not part:
-            continue
-        if part.startswith('**') and part.endswith('**') and len(part) > 4:
-            paragraph.add_run(part[2:-2]).bold = True
-        elif part.startswith('*') and part.endswith('*') and len(part) > 2:
-            paragraph.add_run(part[1:-1]).italic = True
-        else:
-            paragraph.add_run(part)
+    prompt = (f"{dated_system_prompt}\n\n"
+              f"Report Date: {current_date}\n\n"
+              "====================================\n"
+              "Network Traffic Analysis Stats:\n"
+              "====================================\n\n"
+              f"{statistical_report}\n\n"
+              "====================================\n"
+              "Now, write the technical security report:\n"
+              "====================================")
+
+    # Try several current flash models; retry transient 503/429 with backoff.
+    models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest']
+    max_retries = 3
+    last_error = None
+    for model_name in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                resp = client.models.generate_content(
+                    model=model_name, contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=dated_system_prompt, temperature=0.2),
+                )
+                if resp.text:
+                    return resp.text
+                raise RuntimeError('Gemini returned an empty response.')
+            except Exception as e:
+                last_error = e
+                msg = str(e).lower()
+                transient = any(s in msg for s in
+                                ('503', '429', 'high demand', 'unavailable', 'temporar', 'overloaded'))
+                if transient and attempt < max_retries - 1:
+                    time.sleep(2 * (attempt + 1))   # 2s, 4s backoff
+                    continue
+                break   # non-transient (or out of retries) → next model
+    raise RuntimeError(f'Gemini API error after retries/fallbacks: {last_error}')
 
 
 def markdown_to_docx(markdown_text, output):
-    """Convert Markdown text to a formatted DOCX. `output` may be a path or file-like object."""
+    """Convert Markdown to a formatted DOCX (path or file-like). Ports app behaviour."""
     from docx import Document
     from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 
     doc = Document()
     doc.add_heading('Digital Forensics & Network Traffic Analysis Report (CICIDS2017)', level=0)
-
     for raw in markdown_text.split('\n'):
         line = raw.rstrip()
         if not line.strip():
@@ -536,26 +490,36 @@ def markdown_to_docx(markdown_text, output):
         elif line.startswith('### '):
             doc.add_heading(line[4:].strip(), level=3)
         elif line.startswith(('- ', '* ')):
-            _add_inline_md(doc.add_paragraph(style='List Bullet'), line[2:].strip())
+            doc.add_paragraph(line[2:].strip(), style='List Bullet')
         elif re.match(r'^\d+\.\s', line):
-            m = re.match(r'^(\d+)\.\s(.+)', line)
-            _add_inline_md(doc.add_paragraph(style='List Number'), m.group(2).strip() if m else line)
+            mt = re.match(r'^(\d+)\.\s(.+)', line)
+            doc.add_paragraph(mt.group(2).strip() if mt else line, style='List Number')
         else:
-            _add_inline_md(doc.add_paragraph(), line)
-
+            doc.add_paragraph(line)
     doc.save(output)
 
 
-def generate_security_report(file_stream, max_rows=REPORT_MAX_ROWS):
-    """Full pipeline: CSV → classify → statistics → Gemini → DOCX bytes.
+def generate_report(model_id, file_stream, max_rows=1_000_000):
+    """Full pipeline: CSV → classify → statistics → Gemini → DOCX bytes + summary."""
+    m = _get(model_id)
+    df = pd.read_csv(file_stream, nrows=max_rows + 1, low_memory=False, on_bad_lines='skip')
+    truncated = len(df) > max_rows
+    if truncated:
+        df = df.iloc[:max_rows]
+    if df.empty:
+        raise ValueError('The uploaded CSV contains no data rows.')
 
-    Returns (BytesIO docx, meta dict). Raises on failure (no key, Gemini error, etc.).
-    """
-    preds, X, matched, total, truncated = analyze_csv_predictions(file_stream, max_rows=max_rows)
-    stats_text, stats = build_statistics_text(preds, X, matched, total, truncated)
-    gemini_md = call_gemini_api(stats_text)
+    X = _align_dataframe(m, df)
+    Xt = m['scaler'].transform(X) if m['kind'] == 'scaled' else X.values
+    preds = m['encoder'].inverse_transform(m['model'].predict(Xt))
 
+    stats_text = _build_statistics_text(model_id, df, preds)
+    md = call_gemini_api(stats_text)
     bio = BytesIO()
-    markdown_to_docx(gemini_md, bio)
+    markdown_to_docx(md, bio)
     bio.seek(0)
-    return bio, stats
+
+    total = len(preds)
+    benign = sum(1 for p in preds if _is_benign(p))
+    return bio, {'total_rows': total, 'attack_count': total - benign,
+                 'benign_count': benign, 'truncated': truncated}

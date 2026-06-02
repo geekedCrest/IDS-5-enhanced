@@ -18,7 +18,6 @@ const state = {
   charts: {},
   totalBytes: 0,
   lastBps: 0,
-  datasetReportLoaded: false,
 };
 
 // ─── Socket ───────────────────────────────────────────────────────────────────
@@ -528,7 +527,7 @@ function showTab(tab) {
   const content = el(`tab-${tab}`);
   if (content) content.classList.add('active');
 
-  if (tab === 'stats') { updateCharts(); loadDatasetReport(); }
+  if (tab === 'stats') { updateCharts(); }
 }
 
 // ─── Charts ───────────────────────────────────────────────────────────────────
@@ -726,106 +725,6 @@ function updateCounters() {
   setEl('cnt-ssh',  ps.SSH   || 0);
   setEl('cnt-icmp', ps.ICMP  || 0);
   setEl('cnt-arp',  ps.ARP   || 0);
-}
-
-// ─── Dataset Report ───────────────────────────────────────────────────────────
-async function loadDatasetReport(force) {
-  if (state.datasetReportLoaded && !force) return;
-  try {
-    const r = await fetch('/api/dataset-report');
-    const d = await r.json();
-    if (!d || d.success === false) return;
-    state.datasetReportLoaded = true;
-    applyDatasetReport(d);
-  } catch (e) { console.error('dataset-report error', e); }
-}
-
-// Update the whole Statistics dataset panel — from the static default OR an
-// uploaded CSV's actual composition.
-function applyDatasetReport(d) {
-  if (!d) return;
-  const isCsv = d.source === 'csv';
-  setEl('rpt-title', isCsv ? (d.dataset + ' — Dataset Report')
-                           : 'CICIDS 2017/2018 Training Dataset Report');
-  setEl('rpt-sum-samples', (d.total_samples || 0).toLocaleString());
-  setEl('rpt-sum-samples-lbl', isCsv ? 'Rows' : 'Training Samples');
-  setEl('rpt-sum-classes', d.n_classes || 0);
-  setEl('rpt-sum-attack', (d.attack_pct != null ? d.attack_pct : 0) + '%');
-  setEl('rpt-sum-benign', (d.benign_pct != null ? d.benign_pct : 0) + '%');
-  setEl('rpt-sum-features', d.n_features || 0);
-  setEl('rpt-badge-features', (d.n_features || 0) + ' FEATURES');
-  setEl('rpt-badge-balance', isCsv ? 'USER CSV' : 'UNIFIED & BALANCED');
-  setEl('rpt-table-title', 'All ' + (d.n_classes || 0) + ' Classes');
-  setEl('rpt-chart-title', isCsv ? 'Top Classes (CSV Distribution)'
-                                 : 'Top Attack Classes (Training Distribution)');
-  _renderDatasetTable(d.classes || []);
-  _renderDatasetChart(d.classes || []);
-}
-
-function _renderDatasetTable(classes) {
-  const tbody = el('rpt-tbody');
-  if (!tbody) return;
-  if (!classes.length) {
-    tbody.innerHTML = '<tr><td colspan="4" class="empty-state" style="padding:16px">' +
-      'No label column found in this CSV — class distribution unavailable.</td></tr>';
-    return;
-  }
-  const maxPct = Math.max.apply(null, classes.map(c => c.pct || 0)) || 1;
-  tbody.innerHTML = classes.map((c, i) => `
-    <tr class="${c.is_benign ? 'rpt-row-benign' : ''}">
-      <td class="rpt-td-num">${i + 1}</td>
-      <td class="rpt-td-name">${escHtml(c.name)}</td>
-      <td class="rpt-td-cnt">${c.count.toLocaleString()}</td>
-      <td class="rpt-td-pct">
-        <div class="rpt-bar-wrap">
-          <div class="rpt-bar ${c.is_benign ? 'rpt-bar-benign' : 'rpt-bar-attack'}" style="width:${Math.min((c.pct / maxPct) * 100, 100)}%"></div>
-          <span class="rpt-bar-lbl">${c.pct >= 0.001 ? c.pct.toFixed(c.pct >= 1 ? 2 : 4) : '<0.001'}%</span>
-        </div>
-      </td>
-    </tr>
-  `).join('');
-}
-
-function _renderDatasetChart(classes) {
-  const canvas = el('chart-dataset');
-  if (!canvas) return;
-  if (state.charts.dataset) { state.charts.dataset.destroy(); state.charts.dataset = null; }
-  if (!classes.length) return;
-  const top12 = classes.slice(0, 12);
-  const colors = top12.map(c => c.is_benign
-    ? 'rgba(63,185,80,0.82)'
-    : 'rgba(248,81,73,0.75)'
-  );
-  state.charts.dataset = new Chart(canvas, {
-    type: 'bar',
-    data: {
-      labels: top12.map(c => c.name),
-      datasets: [{
-        label: 'Samples',
-        data: top12.map(c => c.count),
-        backgroundColor: colors,
-        borderWidth: 0,
-        borderRadius: 4,
-      }],
-    },
-    options: {
-      indexAxis: 'y',
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          callbacks: {
-            label: ctx => ` ${ctx.parsed.x.toLocaleString()} samples (${top12[ctx.dataIndex].pct.toFixed(2)}%)`,
-          },
-        },
-      },
-      scales: {
-        x: { min: 0, ticks: { callback: v => v >= 1000 ? (v / 1000).toFixed(0) + 'k' : v } },
-        y: { ticks: { font: { size: 10 }, maxRotation: 0 } },
-      },
-    },
-  });
 }
 
 // ─── Rules ────────────────────────────────────────────────────────────────────
@@ -1194,662 +1093,6 @@ function openFile() {
     .catch(() => toast('error', 'Open Capture', 'Request failed'));
 }
 
-let classifierFeatures = null;
-let classifierLoaded = false;
-let classifierCSVFile = null;   // the CSV most recently loaded, reused for the Word report
-
-function loadClassifierTab() {
-  if (classifierLoaded) return;
-  const statusDot  = document.getElementById('clf2-status-dot');
-  const statusText = document.getElementById('clf2-status-text');
-  if (statusDot)  statusDot.className  = 'clf2-status-dot clf2-dot-loading';
-  if (statusText) statusText.textContent = 'Loading model metadata\u2026';
-  fetch('/api/classifier/features')
-    .then(r => r.json())
-    .then(data => {
-      if (!data.success) {
-        toast('error', 'Classifier', data.error);
-        if (statusText) statusText.textContent = 'Error loading model';
-        return;
-      }
-      classifierFeatures = data.features;
-      classifierLoaded = true;
-      renderClassifierForm(data.features);
-      if (data.model_meta) {
-        updateClassesList(data.model_meta.classes || []);
-        if (statusDot)  statusDot.className  = 'clf2-status-dot clf2-dot-ready';
-        if (statusText) statusText.textContent = 'Random Forest \u00b7 78 features \u00b7 27 classes';
-      }
-    })
-    .catch(e => {
-      toast('error', 'Classifier', 'Failed to load features');
-      if (statusText) statusText.textContent = 'Connection error';
-    });
-}
-
-function updateClassesList(classes) {
-  const el = document.getElementById('clf2-classes-list');
-  if (!el) return;
-  el.innerHTML = '';
-  classes.forEach(cls => {
-    const tag = document.createElement('span');
-    const isBenign = cls.toLowerCase() === 'benign';
-    tag.className = 'clf2-class-tag ' + (isBenign ? 'clf2-tag-benign' : 'clf2-tag-attack');
-    tag.textContent = cls;
-    el.appendChild(tag);
-  });
-}
-
-// Update the Model Information panel from an uploaded CSV's composition (dataset
-// name, rows, classes, features, category list). Algorithm/estimators stay constant
-// (they describe the model, not the CSV).
-function applyModelInfo(d) {
-  if (!d) return;
-  const isCsv = d.source === 'csv';
-  const name = d.dataset || 'CICIDS 2017 / 2018';
-  setEl('clf2-iv-dataset', isCsv ? name : 'CICIDS 2017 / 2018');
-  setEl('clf2-iv-algo', d.algorithm || 'Random Forest');
-  setEl('clf2-iv-est', d.estimators || 200);
-  setEl('clf2-iv-features', d.n_features != null ? d.n_features : 78);
-  setEl('clf2-iv-classes', d.n_classes != null ? d.n_classes : 27);
-  setEl('clf2-iv-rows', (d.total_samples != null ? d.total_samples : 916666).toLocaleString());
-  setEl('clf2-iv-rows-k', isCsv ? 'Rows' : 'Training Rows');
-  setEl('clf2-classes-hdr', isCsv ? 'Classes in CSV' : 'Attack Categories');
-  setEl('clf2-header-badge', isCsv ? (name.length > 24 ? name.slice(0, 24) + '…' : name) : 'CICIDS 2017/2018');
-  setEl('clf2-status-text', 'Random Forest · ' + (d.n_features != null ? d.n_features : 78) +
-        ' features · ' + (d.n_classes != null ? d.n_classes : 27) + ' classes');
-  if (d.classes && d.classes.length) updateClassesList(d.classes.map(c => c.name));
-}
-
-function renderClassifierForm(features) {
-  const wrap = document.getElementById('classifier-form-wrap');
-  wrap.innerHTML = '';
-  Object.keys(features).forEach(name => {
-    const meta = features[name];
-    const row = document.createElement('div');
-    row.className = 'clf2-feat-row';
-    const lbl  = meta.label || name;
-    const desc = meta.description || '';
-    const med  = meta.median !== undefined ? meta.median : '';
-    row.innerHTML =
-      `<div class="clf2-feat-meta">` +
-        `<span class="clf2-feat-name">${lbl}</span>` +
-        `<span class="clf2-feat-key">${name}</span>` +
-        (desc ? `<span class="clf2-feat-desc">${desc}</span>` : '') +
-      `</div>` +
-      `<input type="text" class="clf-input clf2-feat-input" ` +
-             `data-field="${name}" data-type="numeric" ` +
-             `placeholder="${med}">`;
-    wrap.appendChild(row);
-  });
-}
-
-function classifierPredict() {
-  if (!classifierFeatures) { toast('error', 'Classifier', 'Features not loaded yet'); return; }
-
-  // If a CSV is loaded, classify the WHOLE CSV (every row) and generate the report.
-  // The result box then shows the full-file breakdown, and a Save dialog appears
-  // for the Word report.
-  if (classifierCSVFile) {
-    const idle    = document.getElementById('clf2-result-idle');
-    const content = document.getElementById('clf2-result-content');
-    const box     = document.getElementById('clf2-result-box');
-    if (idle)    idle.style.display    = 'none';
-    if (content) content.style.display = 'none';
-    if (box)     box.className         = 'clf2-result-box clf2-result-working';
-    toast('info', 'Classify CSV', 'Classifying the whole CSV & generating the Word report…');
-    generateReportFromFile(classifierCSVFile);
-    return;
-  }
-
-  const inputs = document.querySelectorAll('#classifier-form-wrap .clf-input');
-  const row = {};
-  inputs.forEach(inp => {
-    const val = inp.value.trim();
-    if (val !== '') row[inp.dataset.field] = val;
-  });
-
-  const idle    = document.getElementById('clf2-result-idle');
-  const content = document.getElementById('clf2-result-content');
-  const box     = document.getElementById('clf2-result-box');
-  if (idle)    idle.style.display    = 'none';
-  if (content) content.style.display = 'none';
-  if (box)     box.className         = 'clf2-result-box clf2-result-working';
-
-  fetch('/api/classifier/predict', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(row)
-  })
-    .then(r => r.json())
-    .then(data => {
-      if (box) box.className = 'clf2-result-box';
-      if (!data.success) {
-        if (idle) { idle.style.display = 'flex'; idle.querySelector('.clf2-idle-text').textContent = 'Error: ' + data.error; }
-        toast('error', 'Prediction Failed', data.error);
-        return;
-      }
-      const pred     = data.prediction;
-      const isBenign = String(pred).toLowerCase() === 'benign';
-      const flowsSec = document.getElementById('clf2-flows-section');
-      if (flowsSec) flowsSec.style.display = 'none';
-      const ptitle = document.getElementById('clf2-prob-title');
-      if (ptitle) ptitle.textContent = 'Top Probabilities';
-      const labelEl  = document.getElementById('clf2-pred-label');
-      const classEl  = document.getElementById('clf2-pred-class');
-      if (labelEl) { labelEl.textContent = isBenign ? 'BENIGN' : 'THREAT DETECTED'; labelEl.className = 'clf2-pred-label ' + (isBenign ? 'clf2-label-benign' : 'clf2-label-threat'); }
-      if (classEl) classEl.textContent = pred;
-
-      if (data.probabilities) {
-        const probSec  = document.getElementById('clf2-prob-section');
-        const barsDiv  = document.getElementById('prob-bars');
-        if (probSec) probSec.style.display = 'block';
-        if (barsDiv) {
-          barsDiv.innerHTML = '';
-          data.probabilities.forEach(p => {
-            const pBenign = String(p.class).toLowerCase() === 'benign';
-            const bar = document.createElement('div');
-            bar.className = 'prob-row';
-            bar.innerHTML =
-              `<span class="prob-label">${p.class}</span>` +
-              `<div class="prob-track"><div class="prob-fill ${pBenign ? 'fill-benign' : 'fill-threat'}" style="width:${Math.max(p.prob, 0.5)}%"></div></div>` +
-              `<span class="prob-val">${p.prob}%</span>`;
-            barsDiv.appendChild(bar);
-          });
-        }
-      }
-      if (content) content.style.display = 'flex';
-      toast('success', 'Classification', 'Predicted: ' + pred);
-
-      // If a CSV is loaded, generate the Word report (a native Save dialog will appear).
-      if (classifierCSVFile) {
-        toast('info', 'Word Report', 'Generating report — choose where to save it when prompted.');
-        generateReportFromFile(classifierCSVFile);
-      }
-    })
-    .catch(() => {
-      if (box) box.className = 'clf2-result-box';
-      if (idle) idle.style.display = 'flex';
-      toast('error', 'Prediction', 'Request failed');
-    });
-}
-
-// ─── Report-generation progress ────────────────────────────────────────────────
-socket.on('report_progress', (d) => {
-  if (!d) return;
-  updateGenProgress(d.pct, d.message);
-});
-
-let _genCreep = null;
-function showGenProgress() {
-  const gen = el('clf2-gen'), idle = el('clf2-result-idle'), content = el('clf2-result-content');
-  if (idle) idle.style.display = 'none';
-  if (content) content.style.display = 'none';
-  if (gen) gen.style.display = 'flex';
-  const bar = el('clf2-gen-bar');
-  if (bar) bar.classList.add('gen-active');
-  updateGenProgress(6, 'Starting…');
-}
-function updateGenProgress(pct, msg) {
-  const bar = el('clf2-gen-bar'), p = el('clf2-gen-pct'), m = el('clf2-gen-msg');
-  if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
-  if (p) p.textContent = Math.round(Math.max(0, Math.min(100, pct))) + '%';
-  if (m && msg) m.textContent = msg;
-  // During the long Gemini phase (~58%), creep slowly toward 86% so it feels alive.
-  if (_genCreep) { clearInterval(_genCreep); _genCreep = null; }
-  if (pct >= 50 && pct < 88) {
-    let cur = pct;
-    _genCreep = setInterval(() => {
-      cur = Math.min(86, cur + 0.6);
-      const b = el('clf2-gen-bar'), pp = el('clf2-gen-pct');
-      if (b) b.style.width = cur + '%';
-      if (pp) pp.textContent = Math.round(cur) + '%';
-      if (cur >= 86 && _genCreep) { clearInterval(_genCreep); _genCreep = null; }
-    }, 700);
-  }
-}
-function hideGenProgress() {
-  if (_genCreep) { clearInterval(_genCreep); _genCreep = null; }
-  const gen = el('clf2-gen');
-  if (gen) gen.style.display = 'none';
-}
-
-// Render the captured-traffic statistics grid + protocol / port / talker breakdowns.
-function renderTrafficStats(d) {
-  const grid = el('clf2-stats-grid');
-  if (!grid) return;
-  const num = v => (v == null ? 0 : v).toLocaleString();
-  const cards = [
-    ['Total Flows', num(d.total_flows), ''],
-    ['Packets', num(d.total_packets), ''],
-    ['Attacks', num(d.attack_flows), d.attack_flows > 0 ? 'stat-attack' : ''],
-    ['Benign', num(d.benign_flows), 'stat-benign'],
-    ['Attack Rate', (d.attack_pct || 0) + '%', d.attack_flows > 0 ? 'stat-attack' : ''],
-    ['Avg Confidence', (d.avg_confidence || 0) + '%', ''],
-    ['Unique Sources', num(d.unique_sources), ''],
-    ['Dst Ports', num(d.unique_dst_ports), ''],
-  ];
-  let html = cards.map(([lbl, val, cls]) =>
-    `<div class="clf2-stat ${cls}"><span class="clf2-stat-val">${val}</span><span class="clf2-stat-lbl">${lbl}</span></div>`
-  ).join('');
-
-  const chips = (arr, fmt) => (arr || []).map(fmt).join('');
-  const protoRow = chips(d.protocols, ([p, n]) => `<span class="clf2-chip">${escHtml(String(p))} <b>${n}</b></span>`);
-  const portRow  = chips(d.top_ports, ([p, n]) => `<span class="clf2-chip">:${p} <b>${n}</b></span>`);
-  const talkRow  = chips(d.top_talkers, ([s, n]) => `<span class="clf2-chip">${escHtml(String(s))} <b>${n}</b></span>`);
-
-  html += `<div class="clf2-stat-rows">
-    ${protoRow ? `<div class="clf2-stat-row"><span class="clf2-sr-lbl">Protocols</span><span class="clf2-sr-vals">${protoRow}</span></div>` : ''}
-    ${portRow ? `<div class="clf2-stat-row"><span class="clf2-sr-lbl">Top Ports</span><span class="clf2-sr-vals">${portRow}</span></div>` : ''}
-    ${talkRow ? `<div class="clf2-stat-row"><span class="clf2-sr-lbl">Top Sources</span><span class="clf2-sr-vals">${talkRow}</span></div>` : ''}
-  </div>`;
-
-  grid.innerHTML = html;
-  grid.style.display = 'block';
-}
-
-// Classify the REAL captured traffic: ask the server to reassemble flows from the
-// live / simulated / opened-pcap packets and run them through the ML model,
-// using the uploaded CSV's features as the baseline. A CSV is required.
-function classifierAnalyzeTraffic() {
-  if (!classifierCSVFile) {
-    toast('error', 'Load CSV first',
-          'Upload a CSV (Load CSV) so the captured traffic is classified using its features.');
-    return;
-  }
-  const idle    = document.getElementById('clf2-result-idle');
-  const content = document.getElementById('clf2-result-content');
-  const box     = document.getElementById('clf2-result-box');
-  const btn     = document.querySelector('.clf2-livebtn');
-  if (box)     box.className = 'clf2-result-box';
-  if (btn)     btn.classList.add('btn-disabled');
-  showGenProgress();   // live progress bar (driven by 'report_progress' socket events)
-
-  // The feature form (populated from the CSV) is the classification baseline: any
-  // feature not measurable from a captured packet uses these values. Read whatever
-  // is currently in the form so the user can tweak it before classifying.
-  const defaults = {};
-  document.querySelectorAll('#classifier-form-wrap .clf-input').forEach(inp => {
-    const v = inp.value.trim();
-    if (v !== '') defaults[inp.dataset.field] = v;
-  });
-  toast('info', 'Classify Captured Traffic',
-        'Classifying captured flows with your CSV features & generating the Word report — choose where to save it.');
-
-  fetch('/api/classifier/traffic-report', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ defaults: defaults })
-  })
-    .then(r => r.json())
-    .then(data => {
-      hideGenProgress();
-      if (box) box.className = 'clf2-result-box';
-      if (btn) btn.classList.remove('btn-disabled');
-      if (!data.success) {
-        if (idle) { idle.style.display = 'flex'; idle.querySelector('.clf2-idle-text').textContent = data.error; }
-        toast('info', 'Classify Traffic', data.error);
-        return;
-      }
-
-      renderTrafficStats(data);   // the new statistics grid
-
-      const hasAttacks = data.attack_flows > 0;
-      const labelEl = document.getElementById('clf2-pred-label');
-      const classEl = document.getElementById('clf2-pred-class');
-      if (labelEl) {
-        labelEl.textContent = hasAttacks ? 'THREATS DETECTED' : 'ALL BENIGN';
-        labelEl.className = 'clf2-pred-label ' + (hasAttacks ? 'clf2-label-threat' : 'clf2-label-benign');
-      }
-      if (classEl) classEl.textContent =
-        data.total_flows + ' flows • ' + data.attack_flows + ' attack, ' + data.benign_flows + ' benign';
-
-      // Class distribution bars (reuse the prob-bars UI)
-      const probSec = document.getElementById('clf2-prob-section');
-      const ptitle  = document.getElementById('clf2-prob-title');
-      const barsDiv = document.getElementById('prob-bars');
-      if (ptitle) ptitle.textContent = 'Class Distribution';
-      if (probSec) probSec.style.display = 'block';
-      if (barsDiv) {
-        barsDiv.innerHTML = '';
-        (data.distribution || []).forEach(d => {
-          const isBenign = String(d.class).toLowerCase() === 'benign';
-          const row = document.createElement('div');
-          row.className = 'prob-row';
-          row.innerHTML =
-            '<span class="prob-label">' + escHtml(d.class) + ' (' + d.count + ')</span>' +
-            '<div class="prob-track"><div class="prob-fill ' + (isBenign ? 'fill-benign' : 'fill-threat') +
-              '" style="width:' + Math.max(d.pct, 0.5) + '%"></div></div>' +
-            '<span class="prob-val">' + d.pct + '%</span>';
-          barsDiv.appendChild(row);
-        });
-      }
-
-      // Per-flow list (attacks first)
-      const flowsSec = document.getElementById('clf2-flows-section');
-      const flowsDiv = document.getElementById('clf2-flows');
-      if (flowsDiv) {
-        flowsDiv.innerHTML = '';
-        (data.flows || []).forEach(f => {
-          const row = document.createElement('div');
-          row.className = 'clf2-flow-row ' + (f.is_attack ? 'flow-attack' : 'flow-benign');
-          const conf = (f.confidence != null) ? f.confidence + '%' : '';
-          row.innerHTML =
-            '<span class="flow-ep">' + escHtml(f.src) + ':' + f.src_port + ' → :' + f.dst_port + '</span>' +
-            '<span class="flow-proto">' + escHtml(f.proto) + '</span>' +
-            '<span class="flow-pkts">' + f.packets + ' pkt</span>' +
-            '<span class="flow-pred">' + escHtml(f.prediction) + '</span>' +
-            '<span class="flow-conf">' + conf + '</span>';
-          flowsDiv.appendChild(row);
-        });
-      }
-      if (flowsSec) flowsSec.style.display = (data.flows && data.flows.length) ? 'block' : 'none';
-
-      if (content) content.style.display = 'flex';
-      toast(hasAttacks ? 'high' : 'success', 'Traffic Classified',
-            data.total_flows + ' flows analyzed — ' + data.attack_flows + ' flagged as attacks');
-
-      // Word report on the captured-traffic classification
-      if (data.report_saved) {
-        toast('success', 'Word Report', 'Saved to ' + (data.saved_path || data.filename));
-      } else if (data.cancelled_report) {
-        toast('info', 'Word Report', 'Classification done — report save cancelled.');
-      }
-    })
-    .catch(() => {
-      hideGenProgress();
-      if (box) box.className = 'clf2-result-box';
-      if (btn) btn.classList.remove('btn-disabled');
-      if (idle) idle.style.display = 'flex';
-      toast('error', 'Classify Traffic', 'Request failed');
-    });
-}
-
-function classifierClear() {
-  document.querySelectorAll('#classifier-form-wrap .clf-input').forEach(inp => { inp.value = ''; });
-  const idle    = document.getElementById('clf2-result-idle');
-  const content = document.getElementById('clf2-result-content');
-  const box     = document.getElementById('clf2-result-box');
-  if (idle)    { idle.style.display = 'flex'; idle.querySelector && (idle.querySelector('.clf2-idle-text') || {}).textContent !== undefined && (idle.querySelector('.clf2-idle-text').textContent = 'Fill features & click Analyze'); }
-  if (content) content.style.display = 'none';
-  if (box)     box.className = 'clf2-result-box';
-}
-
-function classifierFillDefaults() {
-  if (!classifierFeatures) return;
-  document.querySelectorAll('#classifier-form-wrap .clf-input').forEach(inp => {
-    const meta = classifierFeatures[inp.dataset.field];
-    if (meta && meta.type === 'numeric' && meta.median !== undefined) inp.value = meta.median;
-  });
-}
-
-function classifierLoadCSV(input) {
-  const file = input.files[0];
-  if (!file) return;
-  input.value = '';
-
-  const totalBytes = file.size;
-  const totalGB = totalBytes / (1024 ** 3);
-  const AVG_BYTES_PER_ROW = 220;
-
-  const nameEl    = document.getElementById('clf-csv-name');
-  const progWrap  = document.getElementById('clf-upload-progress');
-  const progBar   = document.getElementById('clf-prog-bar');
-  const progFile  = document.getElementById('clf-prog-filename');
-  const progStat  = document.getElementById('clf-prog-status');
-  const progXfer  = document.getElementById('clf-prog-transferred');
-  const progRows  = document.getElementById('clf-prog-rows');
-  const progLeft  = document.getElementById('clf-prog-remaining');
-
-  function fmtBytes(b) {
-    if (b >= 1024 ** 3) return (b / 1024 ** 3).toFixed(2) + ' GB';
-    if (b >= 1024 ** 2) return (b / 1024 ** 2).toFixed(1) + ' MB';
-    return (b / 1024).toFixed(0) + ' KB';
-  }
-  function fmtRows(b) {
-    const r = Math.floor(b / AVG_BYTES_PER_ROW);
-    return r >= 1000 ? (r / 1000).toFixed(1) + 'k' : r;
-  }
-
-  nameEl.textContent = 'Uploading…';
-  progFile.textContent = file.name;
-  progStat.textContent = 'Uploading…';
-  progBar.style.width = '0%';
-  progBar.classList.remove('prog-done', 'prog-analyzing');
-  progWrap.style.display = 'block';
-
-  const xhr = new XMLHttpRequest();
-
-  xhr.upload.addEventListener('progress', e => {
-    if (!e.lengthComputable) return;
-    const pct = (e.loaded / e.total) * 100;
-    const remaining = e.total - e.loaded;
-    progBar.style.width = pct.toFixed(1) + '%';
-    progStat.textContent = pct.toFixed(1) + '%';
-    progXfer.textContent = fmtBytes(e.loaded) + ' / ' + fmtBytes(e.total);
-    progRows.textContent = '~' + fmtRows(e.loaded) + ' rows sent';
-    progLeft.textContent = fmtBytes(remaining) + ' remaining';
-  });
-
-  xhr.upload.addEventListener('load', () => {
-    progBar.style.width = '100%';
-    progBar.classList.add('prog-analyzing');
-    progStat.textContent = 'Analyzing…';
-    progXfer.textContent = fmtBytes(totalBytes) + ' uploaded';
-    progRows.textContent = 'Reading rows…';
-    progLeft.textContent = '';
-  });
-
-  xhr.addEventListener('load', () => {
-    let data;
-    try { data = JSON.parse(xhr.responseText); } catch { data = { success: false, error: 'Invalid response' }; }
-    if (!data.success) {
-      progStat.textContent = 'Error';
-      progBar.classList.remove('prog-analyzing');
-      progBar.classList.add('prog-error');
-      nameEl.textContent = 'Load failed';
-      toast('error', 'Load CSV', data.error);
-      return;
-    }
-    progBar.style.width = '100%';
-    progBar.classList.remove('prog-analyzing');
-    progBar.classList.add('prog-done');
-    progStat.textContent = 'Done';
-    progXfer.textContent = fmtBytes(totalBytes);
-    progRows.textContent = data.count + ' features loaded';
-    progLeft.textContent = '';
-    nameEl.textContent = file.name + ' (' + data.count + ' features)';
-    classifierFeatures = data.features;
-    classifierLoaded = true;
-    classifierCSVFile = file;   // remember it so "Analyze Traffic" can auto-build the report
-    const hintBar = document.getElementById('clf-report-hint-bar');
-    if (hintBar) hintBar.style.display = 'flex';
-    const liveBtn = document.querySelector('.clf2-livebtn');   // enable captured-traffic classify
-    if (liveBtn) liveBtn.classList.remove('btn-disabled');
-    // Update the Model Information panel + Statistics dataset panel from THIS CSV.
-    if (data.dataset_report) {
-      applyModelInfo(data.dataset_report);
-      state.datasetReportLoaded = false;
-      if (el('tab-stats') && el('tab-stats').classList.contains('active')) loadDatasetReport(true);
-    }
-    renderClassifierForm(data.features);
-    classifierFillDefaults();
-    toast('success', 'CSV Loaded', file.name + ' — ' + data.count + ' features. Click Analyze Traffic to generate the report.');
-    setTimeout(() => { progWrap.style.display = 'none'; }, 4000);
-  });
-
-  xhr.addEventListener('error', () => {
-    progStat.textContent = 'Upload failed';
-    progBar.classList.add('prog-error');
-    nameEl.textContent = 'Upload failed';
-    toast('error', 'Load CSV', 'Network error during upload');
-  });
-
-  const formData = new FormData();
-  formData.append('file', file);
-  xhr.open('POST', '/api/classifier/upload-csv');
-  xhr.send(formData);
-}
-
-// Show the whole-CSV classification breakdown (every row) in the result box.
-function renderCsvClassification(st) {
-  const total   = st.total_rows   || 0;
-  const benign  = st.benign_count || 0;
-  const attacks = st.attack_count || 0;
-  const hasAttacks = attacks > 0;
-
-  const idle    = document.getElementById('clf2-result-idle');
-  const content = document.getElementById('clf2-result-content');
-  if (idle) idle.style.display = 'none';
-
-  const labelEl = document.getElementById('clf2-pred-label');
-  const classEl = document.getElementById('clf2-pred-class');
-  if (labelEl) {
-    labelEl.textContent = hasAttacks ? 'THREATS DETECTED' : 'ALL BENIGN';
-    labelEl.className = 'clf2-pred-label ' + (hasAttacks ? 'clf2-label-threat' : 'clf2-label-benign');
-  }
-  if (classEl) classEl.textContent =
-    total + ' rows classified • ' + attacks + ' attacks, ' + benign + ' benign';
-
-  // Distribution = benign + each attack class, as % of all rows
-  const dist = [];
-  if (benign) dist.push({ class: 'Benign', count: benign });
-  Object.entries(st.attack_distribution || {}).forEach(([c, n]) => dist.push({ class: c, count: n }));
-  dist.sort((a, b) => b.count - a.count);
-
-  const probSec = document.getElementById('clf2-prob-section');
-  const ptitle  = document.getElementById('clf2-prob-title');
-  const barsDiv = document.getElementById('prob-bars');
-  if (ptitle) ptitle.textContent = 'CSV Classification (' + total + ' rows)';
-  if (probSec) probSec.style.display = dist.length ? 'block' : 'none';
-  if (barsDiv) {
-    barsDiv.innerHTML = '';
-    dist.slice(0, 12).forEach(d => {
-      const pct = total ? (d.count / total * 100) : 0;
-      const isBenign = String(d.class).toLowerCase() === 'benign';
-      const row = document.createElement('div');
-      row.className = 'prob-row';
-      row.innerHTML =
-        '<span class="prob-label">' + escHtml(d.class) + ' (' + d.count + ')</span>' +
-        '<div class="prob-track"><div class="prob-fill ' + (isBenign ? 'fill-benign' : 'fill-threat') +
-          '" style="width:' + Math.max(pct, 0.5) + '%"></div></div>' +
-        '<span class="prob-val">' + pct.toFixed(1) + '%</span>';
-      barsDiv.appendChild(row);
-    });
-  }
-
-  const flowsSec = document.getElementById('clf2-flows-section');
-  if (flowsSec) flowsSec.style.display = 'none';
-  if (content) content.style.display = 'flex';
-}
-
-// Bulk-classify a CSV and save a Gemini-authored Word (.docx) security report.
-// The local server pops a native OS "Save As" dialog, so this works in any browser.
-// Triggered after "Analyze Traffic" when a CSV has been loaded.
-function generateReportFromFile(file) {
-  if (!file) return;
-
-  const progWrap  = document.getElementById('clf-upload-progress');
-  const progBar   = document.getElementById('clf-prog-bar');
-  const progFile  = document.getElementById('clf-prog-filename');
-  const progStat  = document.getElementById('clf-prog-status');
-  const progXfer  = document.getElementById('clf-prog-transferred');
-  const progRows  = document.getElementById('clf-prog-rows');
-  const progLeft  = document.getElementById('clf-prog-remaining');
-  const analyzeBtn = document.querySelector('.clf2-analyze-btn');
-
-  function fmtBytes(b) {
-    if (b >= 1024 ** 3) return (b / 1024 ** 3).toFixed(2) + ' GB';
-    if (b >= 1024 ** 2) return (b / 1024 ** 2).toFixed(1) + ' MB';
-    return (b / 1024).toFixed(0) + ' KB';
-  }
-  function done() { if (analyzeBtn) analyzeBtn.classList.remove('btn-disabled'); }
-  if (analyzeBtn) analyzeBtn.classList.add('btn-disabled');
-
-  progFile.textContent = file.name;
-  progStat.textContent = 'Uploading…';
-  progBar.style.width = '0%';
-  progBar.className = 'clf-prog-bar';
-  progWrap.style.display = 'block';
-  progRows.textContent = ''; progLeft.textContent = '';
-
-  const xhr = new XMLHttpRequest();
-
-  xhr.upload.addEventListener('progress', e => {
-    if (!e.lengthComputable) return;
-    const pct = (e.loaded / e.total) * 100;
-    progBar.style.width = pct.toFixed(1) + '%';
-    progStat.textContent = pct.toFixed(1) + '%';
-    progXfer.textContent = fmtBytes(e.loaded) + ' / ' + fmtBytes(e.total);
-    progLeft.textContent = fmtBytes(e.total - e.loaded) + ' remaining';
-  });
-
-  xhr.upload.addEventListener('load', () => {
-    progBar.style.width = '100%';
-    progBar.classList.add('prog-analyzing');
-    progStat.textContent = 'Waiting for save location…';
-    progXfer.textContent = fmtBytes(file.size) + ' uploaded';
-    progLeft.textContent = '';
-    progRows.textContent = 'A "Save As" dialog should appear — pick a location, then it generates (10–60s).';
-  });
-
-  xhr.addEventListener('load', () => {
-    let data;
-    try { data = JSON.parse(xhr.responseText); } catch { data = { success: false, error: 'Invalid server response' }; }
-
-    const resBox = document.getElementById('clf2-result-box');
-    if (resBox) resBox.className = 'clf2-result-box';
-    if (data.success) {
-      const st = data.stats || {};
-      const total = st.total_rows != null ? st.total_rows : '?';
-      const atk   = st.attack_count != null ? st.attack_count : '?';
-      const trunc = st.truncated ? ' (truncated)' : '';
-      progBar.classList.remove('prog-analyzing');
-      progBar.classList.add('prog-done');
-      progStat.textContent = 'Report saved';
-      progRows.textContent = total + ' rows • ' + atk + ' attacks' + trunc;
-      progLeft.textContent = '';
-      progFile.textContent = data.filename || file.name;
-      renderCsvClassification(st);   // show the whole-CSV breakdown in the result box
-      toast('success', 'Word Report', 'Saved to ' + (data.saved_path || data.filename));
-      setTimeout(() => { progWrap.style.display = 'none'; }, 6000);
-      done();
-    } else if (data.cancelled) {
-      progBar.classList.remove('prog-analyzing');
-      progStat.textContent = 'Save cancelled';
-      progRows.textContent = ''; progLeft.textContent = '';
-      const idle = document.getElementById('clf2-result-idle');
-      const content = document.getElementById('clf2-result-content');
-      if (content) content.style.display = 'none';
-      if (idle) { idle.style.display = 'flex'; const t = idle.querySelector('.clf2-idle-text'); if (t) t.textContent = 'Save cancelled'; }
-      toast('info', 'Word Report', 'Save cancelled — no report was created.');
-      setTimeout(() => { progWrap.style.display = 'none'; }, 3500);
-      done();
-    } else {
-      progBar.classList.remove('prog-analyzing');
-      progBar.classList.add('prog-error');
-      progStat.textContent = 'Error'; progRows.textContent = ''; progLeft.textContent = '';
-      const idle = document.getElementById('clf2-result-idle');
-      const content = document.getElementById('clf2-result-content');
-      if (content) content.style.display = 'none';
-      if (idle) { idle.style.display = 'flex'; const t = idle.querySelector('.clf2-idle-text'); if (t) t.textContent = 'Error: ' + (data.error || 'failed'); }
-      toast('error', 'Word Report', data.error || 'Report generation failed');
-      done();
-    }
-  });
-
-  xhr.addEventListener('error', () => {
-    progBar.classList.add('prog-error');
-    progStat.textContent = 'Upload failed';
-    toast('error', 'Word Report', 'Network error during upload');
-    done();
-  });
-
-  const fd = new FormData();
-  fd.append('file', file);
-  xhr.open('POST', '/api/classifier/report');
-  xhr.send(fd);
-}
 // Save the current traffic as a .pcap file. The local server pops a native Save
 // dialog and writes the file with scapy — works in any browser.
 function saveCapture() {
@@ -1867,6 +1110,282 @@ function saveCapture() {
       }
     })
     .catch(() => toast('error', 'Save', 'Request failed'));
+}
+
+// ─── ML Classifier ──────────────────────────────────────────────────────────
+const clfState = { model: 'cyber', features: [], csvFile: null };
+
+function loadClassifierTab() {
+  // Populate the model selector once, then load the current model's info.
+  fetch('/api/classifier/models')
+    .then(r => r.json())
+    .then(d => {
+      if (d.success && d.models && d.models.length) {
+        const sel = el('clf-model');
+        if (sel && !sel.dataset.filled) {
+          sel.innerHTML = d.models
+            .map(m => `<option value="${m.id}"${m.ready ? '' : ' disabled'}>${escHtml(m.label)}${m.ready ? '' : ' (missing)'}</option>`)
+            .join('');
+          sel.dataset.filled = '1';
+        }
+      }
+      clfSelectModel(clfState.model);
+    })
+    .catch(() => clfSelectModel(clfState.model));
+}
+
+function clfSelectModel(modelId) {
+  clfState.model = modelId;
+  const dot = el('clf-status-dot'), txt = el('clf-status-text');
+  if (dot) dot.className = 'clf2-status-dot clf2-dot-loading';
+  if (txt) txt.textContent = 'Loading model…';
+  const form = el('clf-form');
+  if (form) form.innerHTML = '<div class="empty-state">Loading model… (large model, first load may take a few seconds)</div>';
+
+  fetch('/api/classifier/info/' + encodeURIComponent(modelId))
+    .then(r => r.json())
+    .then(d => {
+      if (!d.success) {
+        if (txt) txt.textContent = 'Error';
+        if (dot) dot.className = 'clf2-status-dot';
+        if (form) form.innerHTML = `<div class="empty-state">${escHtml(d.error || 'Failed to load model')}</div>`;
+        toast('error', 'Classifier', d.error || 'Failed to load model');
+        return;
+      }
+      clfState.features = d.features;
+      renderClfForm(d.features);
+      setEl('clf-iv-features', d.n_features);
+      setEl('clf-iv-classes', d.n_classes);
+      setEl('clf-iv-kind', d.kind === 'scaled' ? 'cicids_app_complete.py' : 'cicids_desktop_app.py');
+      setEl('clf-model-badge', d.label);
+      const cl = el('clf-classes-list');
+      if (cl) cl.innerHTML = d.classes.map(c => {
+        const benign = String(c).toLowerCase() === 'benign';
+        return `<span class="clf2-class-tag ${benign ? 'clf2-tag-benign' : 'clf2-tag-attack'}">${escHtml(c)}</span>`;
+      }).join('');
+      if (dot) dot.className = 'clf2-status-dot clf2-dot-ready';
+      if (txt) txt.textContent = 'Random Forest · ' + d.n_features + ' features · ' + d.n_classes + ' classes';
+    })
+    .catch(() => {
+      if (txt) txt.textContent = 'Error';
+      if (dot) dot.className = 'clf2-status-dot';
+      toast('error', 'Classifier', 'Failed to load model info');
+    });
+}
+
+function renderClfForm(features) {
+  const wrap = el('clf-form');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  features.forEach(f => {
+    const row = document.createElement('div');
+    row.className = 'clf2-feat-row';
+    row.innerHTML =
+      `<div class="clf2-feat-meta">` +
+        `<span class="clf2-feat-name">${escHtml(f.label)}</span>` +
+        `<span class="clf2-feat-key">${escHtml(f.name)}</span>` +
+        (f.desc ? `<span class="clf2-feat-desc">${escHtml(f.desc)}</span>` : '') +
+      `</div>` +
+      `<input type="text" class="clf-input clf2-feat-input" data-field="${escHtml(f.name)}" placeholder="${f.default}">`;
+    wrap.appendChild(row);
+  });
+}
+
+function clfFillDefaults() {
+  const byName = {};
+  clfState.features.forEach(f => { byName[f.name] = f.default; });
+  document.querySelectorAll('#clf-form .clf-input').forEach(inp => {
+    const d = byName[inp.dataset.field];
+    if (d !== undefined) inp.value = d;
+  });
+}
+
+function clfClear() {
+  document.querySelectorAll('#clf-form .clf-input').forEach(inp => { inp.value = ''; });
+  const idle = el('clf-result-idle'), content = el('clf-result-content');
+  if (idle) idle.style.display = 'flex';
+  if (content) content.style.display = 'none';
+}
+
+function clfPredict() {
+  const features = {};
+  document.querySelectorAll('#clf-form .clf-input').forEach(inp => {
+    const v = inp.value.trim();
+    if (v !== '') features[inp.dataset.field] = v;
+  });
+  const box = el('clf-result-box');
+  if (box) box.className = 'clf2-result-box clf2-result-working';
+
+  fetch('/api/classifier/predict', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model_id: clfState.model, features })
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (box) box.className = 'clf2-result-box';
+      if (!d.success) { toast('error', 'Predict', d.error || 'failed'); return; }
+      clfShowResult(d.prediction, d.is_attack, d.confidence, d.probabilities, null);
+    })
+    .catch(() => { if (box) box.className = 'clf2-result-box'; toast('error', 'Predict', 'Request failed'); });
+}
+
+function clfShowResult(prediction, isAttack, confidence, probs, statsHtml) {
+  const idle = el('clf-result-idle'), content = el('clf-result-content');
+  if (idle) idle.style.display = 'none';
+  if (content) content.style.display = 'flex';
+
+  const labelEl = el('clf-pred-label'), classEl = el('clf-pred-class');
+  if (labelEl) {
+    labelEl.textContent = isAttack ? 'THREAT DETECTED' : 'BENIGN';
+    labelEl.className = 'clf2-pred-label ' + (isAttack ? 'clf2-label-threat' : 'clf2-label-benign');
+  }
+  if (classEl) classEl.textContent = prediction + (confidence != null ? '  ·  ' + confidence + '% confidence' : '');
+
+  const grid = el('clf-stats-grid');
+  if (grid) { grid.style.display = statsHtml ? 'grid' : 'none'; grid.innerHTML = statsHtml || ''; }
+
+  const probSec = el('clf-prob-section'), bars = el('clf-prob-bars'), ptitle = el('clf-prob-title');
+  if (probs && probs.length && bars) {
+    if (ptitle) ptitle.textContent = 'Top Probabilities';
+    bars.innerHTML = '';
+    probs.forEach(p => {
+      const benign = String(p.class).toLowerCase() === 'benign';
+      const row = document.createElement('div');
+      row.className = 'prob-row';
+      row.innerHTML =
+        '<span class="prob-label">' + escHtml(p.class) + '</span>' +
+        '<div class="prob-track"><div class="prob-fill ' + (benign ? 'fill-benign' : 'fill-threat') +
+          '" style="width:' + Math.max(p.prob, 0.5) + '%"></div></div>' +
+        '<span class="prob-val">' + p.prob + '%</span>';
+      bars.appendChild(row);
+    });
+    if (probSec) probSec.style.display = 'block';
+  } else if (probSec) {
+    probSec.style.display = 'none';
+  }
+}
+
+// ── Classifier sub-tabs (Manual Prediction | Bulk Analysis) ──────────────────
+function clfSub(name) {
+  const isManual = name === 'manual';
+  const m = el('clf-sub-manual'), b = el('clf-sub-bulk');
+  if (m) m.style.display = isManual ? '' : 'none';
+  if (b) b.style.display = isManual ? 'none' : '';
+  const tm = el('clf-subtab-manual'), tb = el('clf-subtab-bulk');
+  if (tm) tm.classList.toggle('active', isManual);
+  if (tb) tb.classList.toggle('active', !isManual);
+  // Charts need a visible canvas to size correctly.
+  if (!isManual && clfbCharts.proto) { clfbCharts.proto.resize(); clfbCharts.threat.resize(); }
+}
+
+// ── Bulk Analysis dashboard ──────────────────────────────────────────────────
+const clfbState = { file: null, running: false };
+const clfbCharts = { proto: null, threat: null };
+const THREAT_COLORS = { LOW: '#26de81', MEDIUM: '#fed330', HIGH: '#fd9644', CRITICAL: '#fc5c65' };
+
+function clfbChosen(input) {
+  clfbState.file = input.files[0] || null;
+  setEl('clfb-filename', clfbState.file ? 'File: ' + clfbState.file.name : 'No file selected');
+}
+
+function clfbStart() {
+  if (clfbState.running) return;
+  if (!clfbState.file) { toast('info', 'Bulk Analysis', 'Choose a CSV file first.'); return; }
+  clfbState.running = true;
+  const btn = el('clfb-start'); if (btn) btn.disabled = true;
+  clfbSetProgress(0);
+  setEl('clfb-status', 'Uploading ' + clfbState.file.name + '…');
+
+  const fd = new FormData();
+  fd.append('file', clfbState.file);
+  fd.append('model_id', clfState.model);
+  fd.append('report', '1');   // run the Gemini Word report with a Save-As dialog
+
+  fetch('/api/classifier/bulk-analyze', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(d => {
+      clfbState.running = false;
+      if (btn) btn.disabled = false;
+      if (!d.success) { toast('error', 'Bulk Analysis', d.error || 'failed'); return; }
+      if (d.report_saved) toast('success', 'Word Report', 'Saved: ' + (d.saved_path || d.filename));
+      else if (d.cancelled) toast('info', 'Word Report', 'Analysis done — report save cancelled.');
+      else toast('success', 'Bulk Analysis', 'Analysis complete.');
+    })
+    .catch(() => {
+      clfbState.running = false;
+      if (btn) btn.disabled = false;
+      toast('error', 'Bulk Analysis', 'Request failed');
+    });
+}
+
+function clfbSetProgress(pct) {
+  const bar = el('clfb-progress');
+  if (bar) bar.style.width = Math.max(0, Math.min(pct, 100)) + '%';
+}
+
+// Real-time updates streamed from the server while the CSV is classified.
+socket.on('clf_bulk', (d) => {
+  if (d.pct != null) clfbSetProgress(d.pct);
+  if (d.msg) setEl('clfb-status', d.msg);
+  if (d.stats) clfbUpdateDashboard(d.stats);
+});
+
+function clfbUpdateDashboard(s) {
+  setEl('clfb-total', (s.total_rows || 0).toLocaleString());
+  setEl('clfb-benign', (s.benign || 0).toLocaleString());
+  setEl('clfb-attacks', (s.attacks || 0).toLocaleString());
+  const tEl = el('clfb-threat');
+  if (tEl) { tEl.textContent = s.system_threat || 'OFFLINE'; tEl.style.color = THREAT_COLORS[s.system_threat] || 'var(--text3)'; }
+
+  // Flow telemetry
+  setEl('clfb-flow-tele',
+    'Total Traffic:    ' + (s.total_rows || 0).toLocaleString() + '\n' +
+    'Benign Traffic:   ' + (s.benign_pct != null ? s.benign_pct : 0) + '%\n' +
+    'Attack Traffic:   ' + (s.attack_pct != null ? s.attack_pct : 0) + '%');
+  setEl('clfb-model-tele',
+    'Top Feature:      ' + (s.top_feature || 'N/A') + ' (' + (s.top_feature_imp != null ? s.top_feature_imp : 0) + '%)\n' +
+    'Mean Flow Dur:    ' + (s.mean_flow_dur != null ? s.mean_flow_dur.toLocaleString() : 0) + ' µs\n' +
+    'Mean Bandwidth:   ' + (s.mean_bandwidth != null ? s.mean_bandwidth.toLocaleString() : 0) + ' B/s');
+
+  // Protocol donut
+  const proto = s.proto_dist || {};
+  const pLabels = Object.keys(proto).filter(k => proto[k] > 0);
+  const pData = pLabels.map(k => proto[k]);
+  const pColors = pLabels.map(k => ({ TCP: '#17c0eb', UDP: '#26de81', Other: '#74b9ff' }[k] || '#a55eea'));
+  clfbDrawChart('proto', 'doughnut', pLabels, pData, pColors);
+
+  // Threat-level bars
+  const td = s.threat_dist || {};
+  const tLabels = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
+  clfbDrawChart('threat', 'bar', tLabels, tLabels.map(k => td[k] || 0), tLabels.map(k => THREAT_COLORS[k]));
+}
+
+function clfbDrawChart(which, type, labels, data, colors) {
+  const id = which === 'proto' ? 'clfb-proto-chart' : 'clfb-threat-chart';
+  const canvas = el(id);
+  if (!canvas || typeof Chart === 'undefined') return;
+  if (clfbCharts[which]) {
+    clfbCharts[which].data.labels = labels;
+    clfbCharts[which].data.datasets[0].data = data;
+    clfbCharts[which].data.datasets[0].backgroundColor = colors;
+    clfbCharts[which].update('none');
+    return;
+  }
+  clfbCharts[which] = new Chart(canvas, {
+    type,
+    data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: type === 'bar' ? 0 : 2, borderColor: '#0a151f', borderRadius: type === 'bar' ? 4 : 0 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      cutout: type === 'doughnut' ? '55%' : undefined,
+      plugins: {
+        legend: { display: type === 'doughnut', position: 'bottom', labels: { color: '#d1f4ff', font: { size: 11 } } },
+      },
+      scales: type === 'bar' ? {
+        x: { ticks: { color: '#d1f4ff', font: { size: 11 } }, grid: { display: false } },
+        y: { ticks: { color: '#9fe9ff', callback: v => v >= 1000 ? (v / 1000).toFixed(0) + 'k' : v }, grid: { color: 'rgba(255,255,255,0.05)' } },
+      } : {},
+    },
+  });
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────

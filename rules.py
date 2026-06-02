@@ -81,6 +81,7 @@ def load_rules(filename: str) -> List[Signature]:
       - Any parse errors are logged but do not stop loading.
     """
     rules = []
+    failures = []
     with open(filename, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
@@ -90,7 +91,12 @@ def load_rules(filename: str) -> List[Signature]:
                 sig = Signature(line)
                 rules.append(sig)
             except Exception as e:
-                print(f"[!] Failed to parse rule at line {line_num}: {line} ({e})")
+                failures.append((line_num, str(e)))
+    if failures:
+        print(f"[*] {filename}: loaded {len(rules)} rules, skipped {len(failures)} "
+              f"unparseable line(s) (first: line {failures[0][0]}: {failures[0][1]}).")
+    else:
+        print(f"[*] {filename}: loaded {len(rules)} rules.")
     return rules
 
 

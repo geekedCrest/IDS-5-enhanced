@@ -5,17 +5,15 @@ import json
 import os
 import sys
 import subprocess
+import tempfile
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request, send_from_directory, send_file
 from flask_socketio import SocketIO, emit
 import netifaces
-from rules import load_rules, verify_rules
+from rules import load_rules, verify_rules, match_rule
 from signature import Signature
-from classifier import (get_model, get_feature_info, get_model_metadata, predict_single,
-                        feature_info_from_csv, generate_security_report, predict_batch,
-                        dataset_report_from_csv)
 from detector_manager import DetectorManager
-from flow_features import FlowTracker
+import classifier
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'ids-dashboard-secret'
@@ -56,14 +54,7 @@ state = {
     # When a .pcap is opened we freeze the background simulation so the loaded
     # packets stay pristine. Start/Restart clears this and resumes live traffic.
     'file_mode': False,
-    # Dataset-composition report for the Statistics panel; set when a CSV is
-    # uploaded so the panel reflects the user's file instead of the static default.
-    'dataset_report': None,
 }
-
-# Reassembles packets into bidirectional flows and computes CICFlowMeter features so
-# the ML classifier can analyse the real dashboard traffic (live / simulated / pcap).
-flow_tracker = FlowTracker()
 
 # Synthetic alerts are off by default in simulation mode (they're fake).
 SIMULATE_ALERTS = False
@@ -266,6 +257,10 @@ def _generate_packet():
     matched_rule = None
     if SIMULATE_ALERTS:
         for rule in ids_rules:
+            # Snort3 content/flow/pcre rules need a real payload, so they are only
+            # evaluated against live-captured traffic, not synthetic packets.
+            if getattr(rule, 'is_snort3', False):
+                continue
             if _packet_matches_rule(rule, src_ip, dst_ip, proto, src_port, dst_port):
                 is_alert = True
                 matched_rule = str(rule)
@@ -479,9 +474,19 @@ def _scapy_to_packet(spkt):
     sp = str(sport) if sport is not None else 'any'
     dp = str(dport) if dport is not None else 'any'
     for rule in ids_rules:
-        if _packet_matches_rule(rule, src_ip, dst_ip, proto, sp, dp):
+        # Snort3 rules carry content/flow/pcre logic, so match them against the
+        # real Scapy packet via the staged matcher; simple positional rules use
+        # the lightweight 5-tuple matcher.
+        if getattr(rule, 'is_snort3', False):
+            try:
+                hit = match_rule(spkt, rule)
+            except Exception:
+                hit = False
+        else:
+            hit = _packet_matches_rule(rule, src_ip, dst_ip, proto, sp, dp)
+        if hit:
             is_alert = True
-            matched_rule = str(rule)
+            matched_rule = rule.msg or str(rule) if getattr(rule, 'is_snort3', False) else str(rule)
             break
 
     threat = 'CRITICAL' if is_alert else 'LOW'
@@ -548,11 +553,6 @@ def _process_live_packet(spkt):
 
     # Feed packet to Detector Manager
     detector_manager.process_packet(spkt)
-    # Feed the flow tracker so the ML classifier can analyse real traffic
-    try:
-        flow_tracker.add_packet(spkt, time.time())
-    except Exception:
-        pass
 
     if state['running'] and not state['paused']:
         socketio.emit('packet', pkt)
@@ -653,6 +653,11 @@ def simulation_thread():
         socketio.sleep(delay)
         if state['live_capture_mode'] or state['file_mode']:
             continue
+        # Don't generate or accumulate simulated traffic until the user clicks
+        # Start — otherwise packets pile up in the background before capture begins
+        # and appear pre-loaded the moment the dashboard is opened.
+        if not state['running'] or state['paused']:
+            continue
 
         pkt = _generate_packet()
         state['packets'].append(pkt)
@@ -666,10 +671,6 @@ def simulation_thread():
         scapy_pkt = simulated_to_scapy(pkt)
         if scapy_pkt:
             detector_manager.process_packet(scapy_pkt)
-            try:
-                flow_tracker.add_packet(scapy_pkt, time.time())
-            except Exception:
-                pass
 
         if state['running'] and not state['paused']:
             socketio.emit('packet', pkt)
@@ -894,101 +895,6 @@ def api_stats():
     })
 
 
-@app.route('/api/dataset-report')
-def api_dataset_report():
-    # If the user uploaded a CSV, show ITS composition instead of the static default.
-    if state.get('dataset_report'):
-        return jsonify(state['dataset_report'])
-    return jsonify({
-        'success': True,
-        'source': 'default',
-        'dataset': 'CICIDS 2017 / 2018 Unified Balanced',
-        'total_samples': 916666,
-        'n_features': 78,
-        'n_classes': 27,
-        'benign_count': 366666,
-        'benign_pct': 40.0,
-        'attack_count': 550000,
-        'attack_pct': 60.0,
-        'algorithm': 'Random Forest',
-        'estimators': 200,
-        'classes': [
-            {'name': 'Benign',                      'count': 366666, 'pct': 40.0000, 'is_benign': True},
-            {'name': 'DDOS attack-HOIC',            'count': 105407, 'pct': 11.5000, 'is_benign': False},
-            {'name': 'DDoS attacks-LOIC-HTTP',      'count':  87830, 'pct':  9.5815, 'is_benign': False},
-            {'name': 'DoS attacks-Hulk',            'count':  70467, 'pct':  7.6873, 'is_benign': False},
-            {'name': 'Bot',                         'count':  44219, 'pct':  4.8239, 'is_benign': False},
-            {'name': 'DoS Hulk',                    'count':  35455, 'pct':  3.8678, 'is_benign': False},
-            {'name': 'FTP-BruteForce',              'count':  29369, 'pct':  3.2039, 'is_benign': False},
-            {'name': 'SSH-Bruteforce',              'count':  28706, 'pct':  3.1316, 'is_benign': False},
-            {'name': 'Infilteration',               'count':  24747, 'pct':  2.7000, 'is_benign': False},
-            {'name': 'PortScan',                    'count':  24136, 'pct':  2.6330, 'is_benign': False},
-            {'name': 'DoS attacks-SlowHTTPTest',    'count':  21512, 'pct':  2.3468, 'is_benign': False},
-            {'name': 'DDoS',                        'count':  19601, 'pct':  2.1383, 'is_benign': False},
-            {'name': 'DoS attacks-GoldenEye',       'count':   6488, 'pct':  0.7078, 'is_benign': False},
-            {'name': 'DoS attacks-Slowloris',       'count':   1673, 'pct':  0.1825, 'is_benign': False},
-            {'name': 'DoS GoldenEye',               'count':   1553, 'pct':  0.1694, 'is_benign': False},
-            {'name': 'FTP-Patator',                 'count':   1241, 'pct':  0.1354, 'is_benign': False},
-            {'name': 'DoS slowloris',               'count':    897, 'pct':  0.0979, 'is_benign': False},
-            {'name': 'SSH-Patator',                 'count':    895, 'pct':  0.0976, 'is_benign': False},
-            {'name': 'DoS Slowhttptest',            'count':    862, 'pct':  0.0940, 'is_benign': False},
-            {'name': 'DDOS attack-LOIC-UDP',        'count':    275, 'pct':  0.0300, 'is_benign': False},
-            {'name': 'Web Attack - Brute Force',    'count':    218, 'pct':  0.0238, 'is_benign': False},
-            {'name': 'Web Attack - XSS',            'count':    102, 'pct':  0.0111, 'is_benign': False},
-            {'name': 'Brute Force -Web',            'count':     84, 'pct':  0.0092, 'is_benign': False},
-            {'name': 'Brute Force -XSS',            'count':     37, 'pct':  0.0040, 'is_benign': False},
-            {'name': 'SQL Injection',               'count':      7, 'pct':  0.0008, 'is_benign': False},
-            {'name': 'Web Attack - SQL Injection',  'count':      4, 'pct':  0.0004, 'is_benign': False},
-            {'name': 'Infiltration',                'count':      2, 'pct':  0.0002, 'is_benign': False},
-        ],
-    })
-
-
-# ─── Classifier API ───────────────────────────────────────────────────────────
-
-@app.route('/api/classifier/features')
-def api_classifier_features():
-    try:
-        info = get_feature_info()
-        meta = get_model_metadata()
-        return jsonify({'success': True, 'features': info, 'model_meta': meta})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-
-@app.route('/api/classifier/predict', methods=['POST'])
-def api_classifier_predict():
-    try:
-        data = request.json or {}
-        result = predict_single(data)
-        return jsonify({'success': True, **result})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-
-@app.route('/api/classifier/upload-csv', methods=['POST'])
-def api_classifier_upload_csv():
-    try:
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'No file uploaded'})
-        f = request.files['file']
-        if not f.filename.lower().endswith('.csv'):
-            return jsonify({'success': False, 'error': 'Only CSV files are supported'})
-        info = feature_info_from_csv(f.stream)
-        # Also compute the dataset-composition report from the CSV's labels so the
-        # Statistics panel reflects the uploaded file instead of the static defaults.
-        report = None
-        try:
-            report = dataset_report_from_csv(f.stream, filename=f.filename)
-            state['dataset_report'] = report
-        except Exception as e:
-            print(f'[WARN] dataset report from CSV failed: {e}')
-        return jsonify({'success': True, 'features': info, 'filename': f.filename,
-                        'count': len(info), 'dataset_report': report})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-
 def _native_dialog(mode, kind, suggested=''):
     """Pop a native OS file dialog (in a subprocess) and return the chosen path or None.
 
@@ -1037,7 +943,6 @@ def _reset_capture_view():
     state['traffic_history'] = []
     state['total_bytes'] = 0
     state['threat_stats'] = {'LOW': 0, 'MEDIUM': 0, 'HIGH': 0, 'CRITICAL': 0}
-    flow_tracker.reset()
 
 
 @app.route('/api/capture/open-pcap', methods=['POST'])
@@ -1077,15 +982,6 @@ def api_open_pcap():
                 pkt = _scapy_to_packet(spkt)
             except Exception:
                 continue
-            # Feed the flow tracker with the packet's real capture time
-            try:
-                pkt_ts = float(spkt.time)
-            except Exception:
-                pkt_ts = time.time()
-            try:
-                flow_tracker.add_packet(spkt, pkt_ts)
-            except Exception:
-                pass
             state['packets'].append(pkt)
             proto_key = pkt['proto'] if pkt['proto'] in state['protocol_stats'] else 'OTHER'
             state['protocol_stats'][proto_key] = state['protocol_stats'].get(proto_key, 0) + 1
@@ -1168,225 +1064,143 @@ def api_save_pcap():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-@app.route('/api/classifier/analyze-traffic', methods=['POST'])
-def api_classifier_analyze_traffic():
-    """Run the ML classifier over the REAL dashboard traffic: reassemble the captured
-    packets into bidirectional flows, compute CICFlowMeter features, and classify each
-    flow with the Random Forest model."""
+# ─── Classifier API (ML traffic classifier — two Random Forest models) ─────────
+
+@app.route('/api/classifier/models')
+def api_classifier_models():
+    """List the available ML models for the dashboard selector."""
     try:
-        snapshot = flow_tracker.snapshot()
-        if not snapshot:
-            return jsonify({'success': False,
-                            'error': 'No traffic captured yet. Start capture, run the '
-                                     'simulation, or open a .pcap first.'}), 200
-
-        metas = [m for m, _f in snapshot]
-        feats = [f for _m, f in snapshot]
-        preds = predict_batch(feats)
-
-        class_counts = {}
-        flows_out = []
-        benign = 0
-        for meta, pred in zip(metas, preds):
-            label = pred['prediction']
-            class_counts[label] = class_counts.get(label, 0) + 1
-            is_benign = label.strip().lower() in ('benign', 'normal')
-            if is_benign:
-                benign += 1
-            flows_out.append({
-                'src': meta['src'],
-                'src_port': meta['sport'],
-                'dst_port': meta['dst_port'],
-                'proto': {6: 'TCP', 17: 'UDP', 1: 'ICMP'}.get(meta['proto'], str(meta['proto'])),
-                'packets': meta['pkts'],
-                'prediction': label,
-                'confidence': pred.get('confidence'),
-                'is_attack': not is_benign,
-            })
-
-        total = len(flows_out)
-        attacks = total - benign
-        # Sort: attacks first (highest confidence), then benign
-        flows_out.sort(key=lambda x: (not x['is_attack'], -(x['confidence'] or 0)))
-        distribution = sorted(class_counts.items(), key=lambda kv: kv[1], reverse=True)
-
-        return jsonify({
-            'success': True,
-            'total_flows': total,
-            'benign_flows': benign,
-            'attack_flows': attacks,
-            'distribution': [{'class': c, 'count': n,
-                              'pct': round(n / total * 100, 1)} for c, n in distribution],
-            'flows': flows_out[:200],
-        })
+        return jsonify({'success': True, 'models': classifier.available_models()})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': str(e)})
 
 
-def _classify_captured_flows(defaults=None):
-    """Classify the captured flows. Returns (breakdown_dict, stats_text) or (None, None)."""
-    snapshot = flow_tracker.snapshot()
-    if not snapshot:
-        return None, None
-    metas = [m for m, _f in snapshot]
-    feats = [f for _m, f in snapshot]
-    preds = predict_batch(feats, defaults=defaults)
-
-    class_counts = {}
-    flows_out = []
-    benign = 0
-    for meta, pred in zip(metas, preds):
-        label = pred['prediction']
-        class_counts[label] = class_counts.get(label, 0) + 1
-        is_benign = label.strip().lower() in ('benign', 'normal')
-        if is_benign:
-            benign += 1
-        flows_out.append({
-            'src': meta['src'], 'src_port': meta['sport'], 'dst_port': meta['dst_port'],
-            'proto': {6: 'TCP', 17: 'UDP', 1: 'ICMP'}.get(meta['proto'], str(meta['proto'])),
-            'packets': meta['pkts'], 'prediction': label,
-            'confidence': pred.get('confidence'), 'is_attack': not is_benign,
-        })
-    total = len(flows_out)
-    attacks = total - benign
-    flows_out.sort(key=lambda x: (not x['is_attack'], -(x['confidence'] or 0)))
-    distribution = sorted(class_counts.items(), key=lambda kv: kv[1], reverse=True)
-
-    # Extra statistics
-    total_packets = sum(f['packets'] for f in flows_out)
-    proto_counts = {}
-    port_counts = {}
-    talker_counts = {}
-    conf_sum = 0.0
-    conf_n = 0
-    for f in flows_out:
-        proto_counts[f['proto']] = proto_counts.get(f['proto'], 0) + 1
-        port_counts[f['dst_port']] = port_counts.get(f['dst_port'], 0) + 1
-        talker_counts[f['src']] = talker_counts.get(f['src'], 0) + 1
-        if f['confidence'] is not None:
-            conf_sum += f['confidence']
-            conf_n += 1
-    top_ports = sorted(port_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
-    top_talkers = sorted(talker_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
-    avg_conf = round(conf_sum / conf_n, 1) if conf_n else 0.0
-
-    breakdown = {
-        'total_flows': total, 'benign_flows': benign, 'attack_flows': attacks,
-        'total_packets': total_packets,
-        'unique_sources': len(talker_counts),
-        'unique_dst_ports': len(port_counts),
-        'avg_confidence': avg_conf,
-        'attack_pct': round(attacks / total * 100, 1) if total else 0,
-        'protocols': sorted(proto_counts.items(), key=lambda kv: kv[1], reverse=True),
-        'top_ports': top_ports,
-        'top_talkers': top_talkers,
-        'distribution': [{'class': c, 'count': n, 'pct': round(n / total * 100, 1)}
-                         for c, n in distribution],
-        'flows': flows_out[:200],
-    }
-
-    # Plain-text statistics fed to Gemini
-    lines = [
-        '=' * 60,
-        'CAPTURED NETWORK TRAFFIC ANALYSIS',
-        'Random Forest classification of live / simulated / pcap flows',
-        '=' * 60, '',
-        f'Total flows analyzed: {total}',
-        f'Benign flows: {benign} ({benign / total * 100:.1f}%)',
-        f'Attack flows: {attacks} ({attacks / total * 100:.1f}%)',
-        '', 'Class distribution:',
-    ]
-    for c, n in distribution:
-        lines.append(f'  {c}: {n} ({n / total * 100:.1f}%)')
-    lines += ['', 'Top flagged (attack) flows:']
-    listed = [f for f in flows_out if f['is_attack']][:40]
-    if listed:
-        for f in listed:
-            lines.append(f"  {f['src']}:{f['src_port']} -> :{f['dst_port']} {f['proto']} | "
-                         f"{f['packets']} pkts | {f['prediction']} ({f['confidence']}%)")
-    else:
-        lines.append('  None — all captured flows classified as benign.')
-    lines.append('')
-    return breakdown, '\n'.join(lines)
-
-
-@app.route('/api/classifier/traffic-report', methods=['POST'])
-def api_traffic_report():
-    """Classify the CAPTURED traffic (live/simulated/pcap flows) using the model
-    (optionally with CSV-median feature defaults), then save a Gemini-authored Word
-    report on that captured-traffic classification via a native Save dialog."""
-    def progress(pct, message, done=False):
-        socketio.emit('report_progress', {'pct': pct, 'message': message, 'done': done})
-
+@app.route('/api/classifier/info/<model_id>')
+def api_classifier_info(model_id):
+    """Load the chosen model and return its feature form + class list."""
     try:
-        body = request.get_json(silent=True) or {}
-        defaults = body.get('defaults') if isinstance(body.get('defaults'), dict) else None
-
-        progress(12, 'Reassembling flows & classifying captured traffic…')
-        breakdown, stats_text = _classify_captured_flows(defaults=defaults)
-        if breakdown is None:
-            progress(100, 'No traffic captured', done=True)
-            return jsonify({'success': False,
-                            'error': 'No traffic captured yet. Start capture, run the '
-                                     'simulation, or open a .pcap first.'}), 200
-
-        progress(35, 'Choose where to save the report…')
-        suggested = 'Traffic_Report_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.docx'
-        save_path = prompt_save_path(suggested)
-        if not save_path:
-            progress(100, 'Report save cancelled', done=True)
-            return jsonify({'success': True, 'report_saved': False,
-                            'cancelled_report': True, **breakdown})
-        if not save_path.lower().endswith('.docx'):
-            save_path += '.docx'
-
-        from classifier import call_gemini_api, markdown_to_docx
-        progress(58, 'Generating AI security report (Gemini)…')
-        md = call_gemini_api(stats_text)
-        progress(88, 'Writing Word document…')
-        markdown_to_docx(md, save_path)
-        progress(100, 'Report saved', done=True)
-
-        return jsonify({'success': True, 'report_saved': True, 'saved_path': save_path,
-                        'filename': os.path.basename(save_path), **breakdown})
+        return jsonify({'success': True, **classifier.get_model_info(model_id)})
     except Exception as e:
-        progress(100, 'Error', done=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/classifier/predict', methods=['POST'])
+def api_classifier_predict():
+    """Classify a single flow from the manual feature form."""
+    try:
+        data = request.json or {}
+        model_id = data.get('model_id', 'cyber')
+        features = data.get('features', {})
+        return jsonify({'success': True, **classifier.predict_single(model_id, features)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/classifier/predict-csv', methods=['POST'])
+def api_classifier_predict_csv():
+    """Bulk-classify an uploaded CSV with the chosen model."""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file uploaded'})
+        f = request.files['file']
+        if not f.filename.lower().endswith('.csv'):
+            return jsonify({'success': False, 'error': 'Only CSV files are supported'})
+        model_id = request.form.get('model_id', 'cyber')
+        result = classifier.predict_csv(model_id, f.stream)
+        return jsonify({'success': True, 'filename': f.filename, **result})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 
 
 @app.route('/api/classifier/report', methods=['POST'])
 def api_classifier_report():
-    """Bulk-classify an uploaded CSV, then save a Gemini-authored Word (.docx) report
-    to a location chosen by the user via a native Save dialog."""
+    """Bulk-classify a CSV and return a Gemini-authored Word (.docx) report download."""
     try:
         if 'file' not in request.files:
             return jsonify({'success': False, 'error': 'No file uploaded'}), 400
         f = request.files['file']
         if not f.filename.lower().endswith('.csv'):
             return jsonify({'success': False, 'error': 'Only CSV files are supported'}), 400
-
-        # Ask WHERE to save first, so a cancel avoids the expensive Gemini call.
+        model_id = request.form.get('model_id', 'cyber')
+        docx_io, stats = classifier.generate_report(model_id, f.stream)
         base = os.path.splitext(os.path.basename(f.filename))[0]
-        suggested = f'Security_Report_{base}.docx'
-        save_path = prompt_save_path(suggested)
-        if not save_path:
-            return jsonify({'success': False, 'cancelled': True,
-                            'error': 'Save cancelled by user.'}), 200
-        if not save_path.lower().endswith('.docx'):
-            save_path += '.docx'
-
-        docx_io, stats = generate_security_report(f.stream)
-        with open(save_path, 'wb') as out:
-            out.write(docx_io.getbuffer())
-
-        return jsonify({
-            'success': True,
-            'saved_path': save_path,
-            'filename': os.path.basename(save_path),
-            'stats': stats,
-        })
+        return send_file(docx_io, as_attachment=True,
+                         download_name=f'Security_Report_{base}.docx',
+                         mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/classifier/bulk-analyze', methods=['POST'])
+def api_classifier_bulk_analyze():
+    """Real-time bulk CSV analysis: classify in chunks, stream live dashboard stats
+    over Socket.IO, then (optionally) let the user pick where to save a Gemini Word
+    report via a native Save-As dialog."""
+    def prog(pct, msg, **extra):
+        socketio.emit('clf_bulk', {'pct': pct, 'msg': msg, **extra})
+        socketio.sleep(0)
+
+    tmp_path = None
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file uploaded'}), 400
+        f = request.files['file']
+        if not f.filename.lower().endswith('.csv'):
+            return jsonify({'success': False, 'error': 'Only CSV files are supported'}), 400
+        model_id = request.form.get('model_id', 'cyber')
+        want_report = request.form.get('report', '1') != '0'
+
+        fd, tmp_path = tempfile.mkstemp(suffix='.csv')
+        os.close(fd)
+        f.save(tmp_path)
+
+        prog(2, 'Counting rows…')
+        total = classifier.count_rows(tmp_path)
+
+        final = None
+        for st in classifier.analyze_csv_chunks(model_id, tmp_path, total):
+            final = st
+            # Reserve the last 5% of the bar for report generation.
+            pct = round(st['pct'] * (0.95 if want_report else 1.0), 1)
+            prog(pct, f"Classifying… {st['processed']:,}/{total:,} rows", stats=st)
+
+        if final is None:
+            return jsonify({'success': False, 'error': 'CSV had no data rows.'}), 200
+
+        result = {'success': True, **final}
+
+        if want_report:
+            prog(96, 'Choose where to save the report…', stats=final)
+            suggested = 'Security_Report_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.docx'
+            save_path = prompt_save_path(suggested)
+            if not save_path:
+                prog(100, 'Analysis done — report save cancelled.', done=True, stats=final, cancelled=True)
+                result.update({'report_saved': False, 'cancelled': True})
+                return jsonify(result)
+            if not save_path.lower().endswith('.docx'):
+                save_path += '.docx'
+            prog(97, 'Generating AI security report (Gemini)…', stats=final)
+            text = classifier.build_report_text(model_id, final)
+            md = classifier.call_gemini_api(text)
+            classifier.markdown_to_docx(md, save_path)
+            result.update({'report_saved': True, 'saved_path': save_path,
+                           'filename': os.path.basename(save_path)})
+            prog(100, 'Report saved: ' + os.path.basename(save_path), done=True,
+                 stats=final, report_saved=True, saved_path=save_path,
+                 filename=os.path.basename(save_path))
+        else:
+            prog(100, 'Analysis complete.', done=True, stats=final)
+
+        return jsonify(result)
+    except Exception as e:
+        prog(100, 'Error: ' + str(e), done=True, error=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 # ─── WebSocket events ─────────────────────────────────────────────────────────
@@ -1471,7 +1285,6 @@ def on_restart():
     state['total_bytes'] = 0
     state['threat_stats'] = {'LOW': 0, 'MEDIUM': 0, 'HIGH': 0, 'CRITICAL': 0}
     state['start_time'] = None
-    flow_tracker.reset()
     emit('cleared', {}, broadcast=True)
     time.sleep(0.3)
     state['running'] = True
