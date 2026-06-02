@@ -13,3 +13,7 @@ venv/
 
 # Secrets — never commit
 gemini_api_key.txt
+
+# Local capture files (test artifacts)
+*.pcap
+*.pcapng

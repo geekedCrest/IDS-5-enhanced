@@ -205,21 +205,23 @@
           <button class="btn-sm" onclick="clearAlerts()">Clear All</button>
           <span class="alerts-count-label" id="alerts-count-label">0 alerts</span>
         </div>
-        <table class="packet-table" id="alert-table">
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>Time</th>
-              <th>Type</th>
-              <th>Threat</th>
-              <th>Source</th>
-              <th>Destination</th>
-              <th>Protocol</th>
-              <th>Rule / Detail</th>
-            </tr>
-          </thead>
-          <tbody id="alert-tbody"></tbody>
-        </table>
+        <div class="alert-table-wrap" id="alert-table-wrap">
+          <table class="packet-table" id="alert-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Time</th>
+                <th>Type</th>
+                <th>Threat</th>
+                <th>Source</th>
+                <th>Destination</th>
+                <th>Protocol</th>
+                <th>Rule / Detail</th>
+              </tr>
+            </thead>
+            <tbody id="alert-tbody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 

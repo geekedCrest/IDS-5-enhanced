@@ -200,9 +200,3 @@ TCP !192.0.0.1:[0-8000] <> 127.0.0.1:!8080 *
   ```python
   socketio.run(app, host='0.0.0.0', port=5001, ...)
   ```
-
----
-
-## License
-
-MIT

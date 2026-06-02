@@ -836,7 +836,7 @@ def api_rules_upload():
             'count': len(ids_rules),
             'selected_rules_file': filename,
             'rules_files': [file for file in os.listdir('.') if file.endswith('.rules')]
-        }, broadcast=True)
+        })
         
         return jsonify({'success': True, 'filename': filename, 'rules_count': len(ids_rules)})
     except Exception as e:
@@ -1111,6 +1111,10 @@ def api_open_pcap():
                 })
                 alerts_added += 1
 
+        # Thread-based detectors (ARP, SYN-scan) drain their queues asynchronously —
+        # give them a moment so their alerts land in state before the client refetches.
+        socketio.sleep(1.2)
+
         loaded = len(state['packets'])
         socketio.emit('pcap_loaded', {
             'filename': os.path.basename(path),
@@ -1118,8 +1122,8 @@ def api_open_pcap():
             'alerts': alerts_added,
             'truncated': truncated,
             'total_in_file': total_in_file,
-        }, broadcast=True)
-        socketio.emit('status_update', _status(), broadcast=True)
+        })
+        socketio.emit('status_update', _status())
 
         return jsonify({'success': True, 'filename': os.path.basename(path),
                         'count': loaded, 'alerts': alerts_added,

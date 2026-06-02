@@ -543,6 +543,8 @@ body[data-threat='critical']::after {
   flex-shrink: 0;
 }
 .alerts-count-label { color: var(--text2); font-size: 12px; }
+/* Scrollable alerts table (sticky header stays, body scrolls) */
+.alert-table-wrap { flex: 1; overflow: auto; min-height: 0; }
 
 /* ─── Stats Tab ─────────────────────────────────────────────────────────── */
 .stats-grid {
@@ -687,6 +689,7 @@ body[data-threat='critical']::after {
   background: linear-gradient(180deg, rgba(13,20,34,0.95), rgba(9,15,26,0.9));
   border-left: 1px solid var(--border);
   display: flex; flex-direction: column; overflow-y: auto;
+  scrollbar-gutter: stable;          /* reserve space so the scrollbar never covers content */
 }
 .sidebar-section {
   border-bottom: 1px solid var(--border);
@@ -1174,17 +1177,25 @@ body[data-threat='critical']::after {
 .clf2-tag-benign { background: rgba(76,175,80,0.12); color: #4caf50; border: 1px solid rgba(76,175,80,0.25); }
 .clf2-tag-attack { background: rgba(244,67,54,0.10); color: #ef9a9a; border: 1px solid rgba(244,67,54,0.20); }
 
-/* ─── Scrollbars ────────────────────────────────────────────────────────── */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: var(--bg); }
-::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--text3); }
+/* ─── Scrollbars (visible, themed) ──────────────────────────────────────── */
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-track { background: rgba(255,255,255,0.03); border-radius: 6px; }
+::-webkit-scrollbar-thumb {
+  background: var(--border2); border-radius: 6px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--accent, #19c7f2); background-clip: padding-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+/* Firefox */
+* { scrollbar-width: thin; scrollbar-color: var(--border2) transparent; }
 
 /* ─── Security Detectors Panel Styles ─── */
 .sb-detectors-list {
   background: transparent;
   max-height: 240px;
   overflow-y: auto;
+  scrollbar-gutter: stable;          /* keep the checkboxes clear of the scrollbar */
+  padding-right: 4px;
 }
 .detector-item {
   display: flex;
